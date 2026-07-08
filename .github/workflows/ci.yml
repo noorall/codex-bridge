@@ -20,9 +20,10 @@ jobs:
       - id: build
         uses: ./.github/actions/build-plugin
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload plugin ZIP
+        uses: actions/upload-artifact@v4
         with:
-          name: codex-bridge-plugin
+          name: codex-bridge-plugin-${{ github.run_number }}-${{ github.sha }}
           path: ${{ steps.build.outputs.plugin_zip }}
           retention-days: 7
           if-no-files-found: error
