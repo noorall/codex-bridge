@@ -8,16 +8,20 @@
             <p style="max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
                 Start Codex CLI from JetBrains IDEs with project-specific context for Codex /ide, keeping Codex in the terminal while the IDE supplies the active file, selection, and open tabs.
             </p>
-            <div style="width: 100%; max-width: 100%; margin: 12px 0 4px 0; line-height: 0; overflow: hidden; box-sizing: border-box;">
+            <div style="width: 720px; height: 450px; margin: 12px 0 4px 0; line-height: 0; overflow: hidden; box-sizing: border-box;">
                 <img src="https://raw.githubusercontent.com/noorall/codex-bridge/master/docs/plugin-overview.jpg"
                      alt="Codex Bridge in a JetBrains IDE"
-                     style="display: block; width: 100%; max-width: 100%; height: auto; box-sizing: border-box;"/>
+                     width="720"
+                     height="450"
+                     style="display: block; width: 720px; height: 450px; border: 0; box-sizing: border-box;"/>
             </div>
             <p style="margin: 6px 0 4px 0;"><b>Feature</b></p>
-            <ul style="max-width: 100%; margin-top: 0; padding-left: 20px; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
-                <li>Launch Codex from the toolbar icon or Tools | Start Codex.</li>
-                <li>Enable Codex /ide context automatically after the Codex terminal is ready.</li>
-            </ul>
+            <p style="margin: 0 0 2px 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
+                - Launch Codex from the toolbar icon or Tools | Start Codex.
+            </p>
+            <p style="margin: 0 0 8px 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
+                - Enable Codex /ide context automatically after the Codex terminal is ready.
+            </p>
             <p style="margin: 10px 0 4px 0;"><b>Configuration</b></p>
             <p style="max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
                 Configure the Codex command and IDE context behavior in Settings | Tools | Codex Bridge.
