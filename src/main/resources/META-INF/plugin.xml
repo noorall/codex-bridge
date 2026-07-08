@@ -8,12 +8,10 @@
             <p style="max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
                 Start Codex CLI from JetBrains IDEs with project-specific context for Codex /ide, keeping Codex in the terminal while the IDE supplies the active file, selection, and open tabs.
             </p>
-            <div style="width: 100%; max-width: 100%; max-height: 520px; margin: 12px 0; overflow: hidden; box-sizing: border-box;">
-                <img src="https://raw.githubusercontent.com/noorall/codex-bridge/master/docs/20260708153533.jpg"
+            <div style="width: 100%; max-width: 100%; margin: 12px 0; overflow: hidden; box-sizing: border-box;">
+                <img src="https://raw.githubusercontent.com/noorall/codex-bridge/master/docs/plugin-overview.jpg"
                      alt="Codex Bridge in a JetBrains IDE"
-                     width="3024"
-                     height="1890"
-                     style="display: block; width: 100%; max-width: 100%; height: auto; max-height: 520px; object-fit: contain; box-sizing: border-box;"/>
+                     style="display: block; width: 100%; max-width: 100%; height: auto; box-sizing: border-box;"/>
             </div>
             <h3>Feature</h3>
             <ul style="max-width: 100%; padding-left: 20px; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
