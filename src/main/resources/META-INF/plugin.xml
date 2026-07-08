@@ -9,10 +9,12 @@
                 Start Codex CLI from JetBrains IDEs with project-specific context for Codex /ide, keeping Codex in the terminal while the IDE supplies the active file, selection, and open tabs.
             </p>
             <p style="margin: 6px 0 4px 0;"><b>Feature</b></p>
-            <ul style="margin: 0 0 8px 0; padding-left: 0; list-style-position: inside; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
-                <li>Launch Codex from the toolbar icon or Tools | Start Codex.</li>
-                <li>Enable Codex /ide context automatically after the Codex terminal is ready.</li>
-            </ul>
+            <p style="margin: 0 0 2px 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
+                &#8226;&nbsp;Launch Codex from the toolbar icon or Tools | Start Codex.
+            </p>
+            <p style="margin: 0 0 8px 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
+                &#8226;&nbsp;Enable Codex /ide context automatically after the Codex terminal is ready.
+            </p>
             <p style="margin: 10px 0 4px 0;"><b>Configuration</b></p>
             <p style="max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
                 Configure the Codex command and IDE context behavior in Settings | Tools | Codex Bridge.
