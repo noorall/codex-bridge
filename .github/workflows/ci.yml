@@ -20,10 +20,14 @@ jobs:
       - id: build
         uses: ./.github/actions/build-plugin
 
+      - name: Build artifact name
+        id: artifact-name
+        run: echo "name=codex-bridge-plugin-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Upload plugin ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: codex-bridge-plugin-${{ github.run_number }}-${{ github.sha }}
+          name: ${{ steps.artifact-name.outputs.name }}
           path: ${{ steps.build.outputs.plugin_zip }}
           retention-days: 7
           if-no-files-found: error
