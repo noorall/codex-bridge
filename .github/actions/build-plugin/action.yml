@@ -1,0 +1,46 @@
+name: Build Codex Bridge plugin
+description: Shared Ubuntu Gradle build path for CI and releases.
+
+outputs:
+  plugin_zip:
+    description: Path to the single built plugin ZIP.
+    value: ${{ steps.artifact.outputs.plugin_zip }}
+  plugin_name:
+    description: File name of the built plugin ZIP.
+    value: ${{ steps.artifact.outputs.plugin_name }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: '8.14'
+
+    - name: Build and verify plugin
+      shell: bash
+      run: gradle --no-daemon clean check buildPlugin verifyPluginStructure
+
+    - name: Locate plugin ZIP
+      id: artifact
+      shell: bash
+      run: |
+        mapfile -t zips < <(find build/distributions -maxdepth 1 -type f -name '*.zip' | sort)
+        if [ "${#zips[@]}" -ne 1 ]; then
+          echo "::error::Expected exactly one plugin ZIP in build/distributions, found ${#zips[@]}."
+          printf '%s\n' "${zips[@]}"
+          exit 1
+        fi
+
+        plugin_zip="${zips[0]}"
+        plugin_name="$(basename "$plugin_zip")"
+        {
+          echo "plugin_zip=$plugin_zip"
+          echo "plugin_name=$plugin_name"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "Built $plugin_name"

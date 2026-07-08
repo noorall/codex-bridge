@@ -1,0 +1,225 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'CHANGELOG.md'
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+      should_release: ${{ steps.extract.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from commit message
+        id: extract
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B | head -1)
+          echo "commit subject: $COMMIT_MSG"
+          if [[ "$COMMIT_MSG" =~ ^chore:\ release\ codex-bridge\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "release requested: v$VERSION"
+          else
+            echo "commit subject does not match 'chore: release codex-bridge vX.Y.Z'; skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check Gradle project version
+        if: steps.extract.outputs.should_release == 'true'
+        run: |
+          VERSION="${{ steps.extract.outputs.version }}"
+          BUILD_VERSION=$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.gradle.kts | head -1)
+          if [ "$BUILD_VERSION" != "$VERSION" ]; then
+            echo "::error::build.gradle.kts version is '$BUILD_VERSION', expected '$VERSION'"
+            exit 1
+          fi
+
+      - name: Check CHANGELOG.md has top section for version
+        if: steps.extract.outputs.should_release == 'true'
+        run: |
+          VERSION="${{ steps.extract.outputs.version }}"
+          if ! grep -qE "^## \[${VERSION}\] " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is missing a '## [$VERSION] - YYYY-MM-DD' section"
+            exit 1
+          fi
+          TOP=$(grep -nE '^## \[' CHANGELOG.md | head -1 | cut -d: -f1)
+          if ! sed -n "${TOP}p" CHANGELOG.md | grep -qE "^## \[${VERSION}\] "; then
+            echo "::error::CHANGELOG.md top-most version section is not '[$VERSION]'"
+            exit 1
+          fi
+
+  build-plugin:
+    needs: validate
+    if: needs.validate.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: build
+        uses: ./.github/actions/build-plugin
+
+      - name: Package plugin and digest
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          PLUGIN_ZIP="${{ steps.build.outputs.plugin_zip }}"
+          ASSET="codex-bridge-v${VERSION}.zip"
+
+          mkdir -p dist
+          cp "$PLUGIN_ZIP" "dist/$ASSET"
+          (cd dist && sha256sum "$ASSET" > "$ASSET.sha256")
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    needs: [validate, build-plugin]
+    if: needs.validate.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: List assets
+        run: ls -la dist
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Extract CHANGELOG section
+        id: changelog
+        run: |
+          CONTENT=$(awk '
+            /^## \[/ { if (seen) exit; seen=1; next }
+            seen { print }
+          ' CHANGELOG.md | sed 's/^###/##/')
+          {
+            echo 'content<<CHANGELOG_EOF'
+            echo "$CONTENT"
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Previous tag
+        id: prev
+        run: |
+          PREV=$(git tag --list 'v*' --sort=-v:refname | sed -n '1p')
+          if [ -z "$PREV" ]; then
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_previous=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$PREV" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate What's Changed
+        id: whats_changed
+        run: |
+          REPO="${{ github.repository }}"
+          REPO_ESCAPED=$(printf '%s' "$REPO" | sed 's/\//\\\//g')
+          CURRENT_TAG="v${{ needs.validate.outputs.version }}"
+          PREVIOUS_TAG="${{ steps.prev.outputs.tag }}"
+          HAS_PREVIOUS="${{ steps.prev.outputs.has_previous }}"
+
+          {
+            echo "## What's Changed"
+            echo ""
+          } > whats_changed.md
+
+          if [ "$HAS_PREVIOUS" = "true" ]; then
+            git log "${PREVIOUS_TAG}..HEAD" --pretty=format:"* %s **by \\@%an** in %H" --no-merges > commits.txt
+            TOTAL=$(git rev-list --count "${PREVIOUS_TAG}..HEAD" --no-merges)
+          else
+            git log --pretty=format:"* %s **by \\@%an** in %H" --no-merges > commits.txt
+            TOTAL=$(git rev-list --count HEAD --no-merges)
+          fi
+
+          LIMIT=10
+          COUNT=0
+          while IFS= read -r line; do
+            if [ "$COUNT" -ge "$LIMIT" ]; then
+              break
+            fi
+            if echo "$line" | grep -qE '#[0-9]+'; then
+              line=$(echo "$line" | sed -E 's/ in [a-f0-9]{40}$//')
+              line=$(echo "$line" | sed -E 's/#([0-9]+)/in [#\1](https:\/\/github.com\/'"$REPO_ESCAPED"'\/pull\/\1)/g')
+            else
+              HASH=$(echo "$line" | grep -oE '[a-f0-9]{40}$' || true)
+              if [ -n "$HASH" ]; then
+                SHORT="${HASH:0:7}"
+                line=$(echo "$line" | sed "s/${HASH}\$/[${SHORT}](https:\/\/github.com\/${REPO_ESCAPED}\/commit\/${HASH})/")
+              fi
+            fi
+            echo "$line" >> whats_changed.md
+            COUNT=$((COUNT + 1))
+          done < commits.txt
+
+          rm -f commits.txt
+
+          if [ "$TOTAL" -gt "$LIMIT" ]; then
+            REMAINING=$((TOTAL - LIMIT))
+            {
+              echo ""
+              echo "_and ${REMAINING} more, see the Full Changelog below._"
+            } >> whats_changed.md
+          fi
+
+          {
+            echo ""
+            echo ""
+            if [ "$HAS_PREVIOUS" = "true" ]; then
+              echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREVIOUS_TAG}...${CURRENT_TAG}"
+            else
+              echo "**Full Changelog**: https://github.com/${REPO}/commits/${CURRENT_TAG}"
+            fi
+          } >> whats_changed.md
+
+          {
+            echo 'content<<WC_EOF'
+            cat whats_changed.md
+            echo 'WC_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.validate.outputs.version }}
+          name: v${{ needs.validate.outputs.version }}
+          body: |
+            ${{ steps.changelog.outputs.content }}
+
+            ${{ steps.whats_changed.outputs.content }}
+          files: |
+            dist/codex-bridge-v${{ needs.validate.outputs.version }}.zip
+            dist/codex-bridge-v${{ needs.validate.outputs.version }}.zip.sha256
+          draft: false
+          prerelease: false

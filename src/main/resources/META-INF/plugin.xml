@@ -1,0 +1,74 @@
+<idea-plugin>
+    <id>com.noorall.codex.bridge</id>
+    <name>Codex Bridge</name>
+    <vendor url="https://github.com/noorall" email="noorall.orz@gmail.com">Noorall</vendor>
+
+    <description><![CDATA[
+        <style>
+            .codex-bridge-overview {
+                width: auto;
+                max-width: 100%;
+                box-sizing: border-box;
+                white-space: normal;
+                overflow-wrap: break-word;
+                word-wrap: break-word;
+            }
+            .codex-bridge-overview * {
+                max-width: 100%;
+                box-sizing: border-box;
+            }
+            .codex-bridge-overview img {
+                display: block;
+                width: auto;
+                max-width: 100%;
+                height: auto;
+            }
+        </style>
+        <div class="codex-bridge-overview">
+            <p>
+                Start Codex CLI from JetBrains IDEs with project-specific context for Codex /ide, keeping Codex in the terminal while the IDE supplies the active file, selection, and open tabs.
+            </p>
+            <p>
+                <img src="https://raw.githubusercontent.com/noorall/codex-bridge/master/docs/20260708153533.jpg"
+                     alt="Codex Bridge in a JetBrains IDE" width="420"/>
+            </p>
+            <h3>Feature</h3>
+            <ul>
+                <li>Launch Codex from the toolbar icon or Tools | Start Codex.</li>
+                <li>Enable Codex /ide context automatically after the Codex terminal is ready.</li>
+            </ul>
+            <h3>Configuration</h3>
+            <p>
+                Configure the Codex command and IDE context behavior in Settings | Tools | Codex Bridge.
+            </p>
+            <h3>Open Source</h3>
+            <p>
+                GitHub: <a href="https://github.com/noorall/codex-bridge">https://github.com/noorall/codex-bridge</a>
+            </p>
+        </div>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.plugins.terminal</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <postStartupActivity implementation="com.noorall.codex.bridge.CodexProjectActivity"/>
+        <applicationConfigurable
+                id="codex.bridge.settings"
+                parentId="tools"
+                instance="com.noorall.codex.bridge.CodexSettingsConfigurable"
+                displayName="Codex Bridge"/>
+    </extensions>
+
+    <actions>
+        <action
+                id="com.noorall.codex.bridge.LaunchCodexAction"
+                class="com.noorall.codex.bridge.LaunchCodexAction"
+                text="Start Codex"
+                description="Start Codex with JetBrains IDE context"
+                icon="/icons/codex-bridge.svg">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <add-to-group group-id="MainToolbarRight" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

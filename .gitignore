@@ -1,0 +1,42 @@
+# IDEs
+.idea/
+.vscode/
+.fleet/
+.zed/
+.cursor/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+
+# Gradle / Kotlin / build output
+.gradle/
+.intellijPlatform/
+.kotlin/
+build/
+out/
+target/
+classes/
+
+# Dependencies and tool caches
+node_modules/
+.npm/
+.pnpm-store/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
