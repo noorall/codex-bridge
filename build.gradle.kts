@@ -1,3 +1,6 @@
+import org.jetbrains.intellij.platform.gradle.IntelliJPlatformType
+import org.jetbrains.intellij.platform.gradle.tasks.VerifyPluginTask
+
 plugins {
     id("java")
     id("com.diffplug.spotless") version "8.8.0"
@@ -37,39 +40,28 @@ fun latestChangelogHtml(changelogFile: java.io.File): String {
     val html = StringBuilder()
     html.append("<h2>").append(markdownInlineToHtml(section.first().removePrefix("## ").trim())).append("</h2>\n")
 
-    var inList = false
-    fun closeList() {
-        if (inList) {
-            html.append("</ul>\n")
-            inList = false
-        }
-    }
-
     section.drop(1).forEach { rawLine ->
         val line = rawLine.trim()
         when {
-            line.isBlank() -> closeList()
+            line.isBlank() -> Unit
 
             line.startsWith("### ") -> {
-                closeList()
-                html.append("<h3>").append(markdownInlineToHtml(line.removePrefix("### ").trim())).append("</h3>\n")
+                html.append("""<p style="margin: 10px 0 4px 0;"><b>""")
+                    .append(markdownInlineToHtml(line.removePrefix("### ").trim()))
+                    .append("</b></p>\n")
             }
 
             line.startsWith("- ") -> {
-                if (!inList) {
-                    html.append("<ul>\n")
-                    inList = true
-                }
-                html.append("<li>").append(markdownInlineToHtml(line.removePrefix("- ").trim())).append("</li>\n")
+                html.append("""<p style="margin: 0 0 2px 0;">&#8226;&nbsp;""")
+                    .append(markdownInlineToHtml(line.removePrefix("- ").trim()))
+                    .append("</p>\n")
             }
 
             else -> {
-                closeList()
                 html.append("<p>").append(markdownInlineToHtml(line)).append("</p>\n")
             }
         }
     }
-    closeList()
 
     return pluginHtmlLayout("codex-bridge-change-notes", html.toString())
 }
@@ -88,9 +80,6 @@ fun pluginHtmlLayout(className: String, bodyHtml: String): String {
             .$className * {
                 max-width: 100%;
                 box-sizing: border-box;
-            }
-            .$className ul {
-                padding-left: 20px;
             }
             .$className code {
                 white-space: normal;
@@ -124,6 +113,7 @@ dependencies {
     intellijPlatform {
         create("IC", "2024.3.6")
         bundledPlugin("org.jetbrains.plugins.terminal")
+        pluginVerifier()
         testFramework(org.jetbrains.intellij.platform.gradle.TestFrameworkType.Platform)
     }
 }
@@ -160,6 +150,23 @@ intellijPlatform {
         }
 
         changeNotes = latestChangelogHtml(file("CHANGELOG.md"))
+    }
+
+    pluginVerification {
+        ides {
+            ide(IntelliJPlatformType.IntellijIdeaCommunity, "2026.1.4")
+        }
+
+        failureLevel.set(
+            listOf(
+                VerifyPluginTask.FailureLevel.COMPATIBILITY_WARNINGS,
+                VerifyPluginTask.FailureLevel.COMPATIBILITY_PROBLEMS,
+                VerifyPluginTask.FailureLevel.DEPRECATED_API_USAGES,
+                VerifyPluginTask.FailureLevel.SCHEDULED_FOR_REMOVAL_API_USAGES,
+                VerifyPluginTask.FailureLevel.MISSING_DEPENDENCIES,
+                VerifyPluginTask.FailureLevel.INVALID_PLUGIN,
+            ),
+        )
     }
 }
 

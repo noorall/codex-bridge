@@ -17,13 +17,13 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.startup.StartupActivity
+import com.intellij.openapi.startup.ProjectActivity
 import com.intellij.openapi.util.Disposer
 
 class CodexProjectActivity :
-    StartupActivity,
+    ProjectActivity,
     DumbAware {
-    override fun runActivity(project: Project) {
+    override suspend fun execute(project: Project) {
         val bridge = service<CodexIpcService>()
         bridge.registerProject(project)
         Disposer.register(

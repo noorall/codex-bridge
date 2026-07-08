@@ -13,6 +13,7 @@
  */
 package com.noorall.codex.bridge
 
+import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
@@ -35,6 +36,8 @@ import java.util.function.Consumer
 import javax.swing.SwingUtilities
 
 class LaunchCodexAction : AnAction() {
+    override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
+
     override fun update(event: AnActionEvent) {
         event.presentation.isEnabled = event.getData(CommonDataKeys.PROJECT) != null
         if (event.isFromActionToolbar) {

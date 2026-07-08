@@ -19,7 +19,7 @@ import com.google.gson.JsonParser
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
-import com.intellij.openapi.application.runReadAction
+import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.fileEditor.FileEditorManager
@@ -280,7 +280,7 @@ class CodexIpcService : Disposable {
         return requireNotNull(result)
     }
 
-    private fun snapshot(project: Project): IdeContext = runReadAction {
+    private fun snapshot(project: Project): IdeContext = ReadAction.compute<IdeContext, RuntimeException> {
         val editor = FileEditorManager.getInstance(project).selectedTextEditor
         val activeFile = editor?.let { currentEditor ->
             val file = com.intellij.openapi.fileEditor.FileDocumentManager

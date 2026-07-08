@@ -23,7 +23,7 @@ runs:
 
     - name: Build and verify plugin
       shell: bash
-      run: gradle --no-daemon clean check buildPlugin verifyPluginStructure
+      run: gradle --no-daemon clean check buildPlugin verifyPlugin verifyPluginStructure
 
     - name: Locate plugin ZIP
       id: artifact
