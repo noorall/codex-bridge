@@ -1,1 +1,1 @@
-rootProject.name = "codex-bridge"
+rootProject.name = "codex-cli-bridge"

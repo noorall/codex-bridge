@@ -1,6 +1,6 @@
 <idea-plugin>
     <id>com.noorall.codex.bridge</id>
-    <name>Codex Bridge</name>
+    <name>Codex CLI Bridge</name>
     <vendor url="https://github.com/noorall" email="noorall.orz@gmail.com">Noorall</vendor>
 
     <description><![CDATA[
@@ -17,7 +17,7 @@
             </p>
             <p style="margin: 10px 0 4px 0;"><b>Configuration</b></p>
             <p style="max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
-                Configure the Codex command and IDE context behavior in Settings | Tools | Codex Bridge.
+                Configure the Codex command and IDE context behavior in Settings | Tools | Codex CLI Bridge.
             </p>
             <p style="margin: 10px 0 4px 0;"><b>Open Source</b></p>
             <p style="max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
@@ -35,7 +35,7 @@
                 id="codex.bridge.settings"
                 parentId="tools"
                 instance="com.noorall.codex.bridge.CodexSettingsConfigurable"
-                displayName="Codex Bridge"/>
+                displayName="Codex CLI Bridge"/>
     </extensions>
 
     <actions>

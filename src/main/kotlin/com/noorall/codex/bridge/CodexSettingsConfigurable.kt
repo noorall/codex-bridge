@@ -30,7 +30,7 @@ class CodexSettingsConfigurable : Configurable {
     private var autoEnableIdeContextBox: JBCheckBox? = null
     private var component: JPanel? = null
 
-    override fun getDisplayName(): String = "Codex Bridge"
+    override fun getDisplayName(): String = "Codex CLI Bridge"
 
     override fun createComponent(): JComponent {
         val field = JBTextField()

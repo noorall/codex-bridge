@@ -1,4 +1,4 @@
-name: Build Codex Bridge plugin
+name: Build Codex CLI Bridge plugin
 description: Shared Ubuntu Gradle build path for CI and releases.
 
 outputs:

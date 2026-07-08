@@ -26,13 +26,13 @@ jobs:
         run: |
           COMMIT_MSG=$(git log -1 --pretty=%B | head -1)
           echo "commit subject: $COMMIT_MSG"
-          if [[ "$COMMIT_MSG" =~ ^chore:\ release\ codex-bridge\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+          if [[ "$COMMIT_MSG" =~ ^chore:\ release\ codex-cli-bridge\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             VERSION="${BASH_REMATCH[1]}"
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "should_release=true" >> "$GITHUB_OUTPUT"
             echo "release requested: v$VERSION"
           else
-            echo "commit subject does not match 'chore: release codex-bridge vX.Y.Z'; skipping release."
+            echo "commit subject does not match 'chore: release codex-cli-bridge vX.Y.Z'; skipping release."
             echo "should_release=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -74,7 +74,7 @@ jobs:
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
           PLUGIN_ZIP="${{ steps.build.outputs.plugin_zip }}"
-          ASSET="codex-bridge-v${VERSION}.zip"
+          ASSET="codex-cli-bridge-v${VERSION}.zip"
 
           mkdir -p dist
           cp "$PLUGIN_ZIP" "dist/$ASSET"
@@ -219,7 +219,7 @@ jobs:
 
             ${{ steps.whats_changed.outputs.content }}
           files: |
-            dist/codex-bridge-v${{ needs.validate.outputs.version }}.zip
-            dist/codex-bridge-v${{ needs.validate.outputs.version }}.zip.sha256
+            dist/codex-cli-bridge-v${{ needs.validate.outputs.version }}.zip
+            dist/codex-cli-bridge-v${{ needs.validate.outputs.version }}.zip.sha256
           draft: false
           prerelease: false

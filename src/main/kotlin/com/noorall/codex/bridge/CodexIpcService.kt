@@ -337,7 +337,7 @@ class CodexIpcService : Disposable {
         }
 
         return chars.subSequence(start, start + MAX_ACTIVE_SELECTION_CHARS).toString() +
-            "\n[Selection truncated by Codex Bridge to $MAX_ACTIVE_SELECTION_CHARS characters.]"
+            "\n[Selection truncated by Codex CLI Bridge to $MAX_ACTIVE_SELECTION_CHARS characters.]"
     }
 
     private fun language(project: Project, document: com.intellij.openapi.editor.Document): String? {

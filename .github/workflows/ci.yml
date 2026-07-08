@@ -22,7 +22,7 @@ jobs:
 
       - name: Build artifact name
         id: artifact-name
-        run: echo "name=codex-bridge-plugin-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: echo "name=codex-cli-bridge-plugin-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare installable plugin artifact
         run: |

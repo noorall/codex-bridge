@@ -1,6 +1,5 @@
-# Codex Bridge
+# Codex CLI Bridge
 
-[![GitHub](https://img.shields.io/badge/GitHub-noorall%2Fcodex--bridge-181717?logo=github)](https://github.com/noorall/codex-bridge)
 [![Release](https://img.shields.io/github/v/release/noorall/codex-bridge?sort=semver)](https://github.com/noorall/codex-bridge/releases)
 [![CI](https://github.com/noorall/codex-bridge/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/noorall/codex-bridge/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -8,13 +7,13 @@
 [![Java](https://img.shields.io/badge/Java-17-orange)](build.gradle.kts)
 [![Gradle](https://img.shields.io/badge/Gradle-8.14-02303A?logo=gradle)](build.gradle.kts)
 
-Codex Bridge is a JetBrains IDE plugin that starts Codex CLI and provides project-specific editor context to Codex `/ide`.
+Codex CLI Bridge is a JetBrains IDE plugin that starts Codex CLI and provides project-specific editor context to Codex `/ide`.
 
 The plugin keeps Codex CLI as the agent host in the terminal. JetBrains provides context for each project's active file, selection ranges, selected text, and open tabs. It does not use ACP or MCP, and it does not make the IDE host the agent.
 
 ## Screenshot
 
-![Codex Bridge in a JetBrains IDE](docs/20260708153533.jpg)
+![Codex CLI Bridge in a JetBrains IDE](docs/20260708153533.jpg)
 
 ## What It Sends
 
@@ -52,11 +51,11 @@ gradle spotlessApply
 
 1. Install/run the plugin in a JetBrains IDE.
 2. Open the same project in the IDE.
-3. Configure `Settings | Tools | Codex Bridge` if `codex` is not the command you want, or if you want to turn automatic IDE context on or off.
+3. Configure `Settings | Tools | Codex CLI Bridge` if `codex` is not the command you want, or if you want to turn automatic IDE context on or off.
 4. Click the Codex toolbar icon or use `Tools | Start Codex`.
 5. Send a prompt.
 
-The plugin enables `/ide` automatically after Codex is ready. It watches the terminal for the Codex prompt, then sends `/ide on`. You can turn this off in `Settings | Tools | Codex Bridge`.
+The plugin enables `/ide` automatically after Codex is ready. It watches the terminal for the Codex prompt, then sends `/ide on`. You can turn this off in `Settings | Tools | Codex CLI Bridge`.
 
 Codex will fetch fresh IDE context immediately before the outgoing prompt.
 
