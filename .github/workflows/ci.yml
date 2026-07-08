@@ -24,10 +24,16 @@ jobs:
         id: artifact-name
         run: echo "name=codex-bridge-plugin-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload plugin ZIP
+      - name: Prepare installable plugin artifact
+        run: |
+          rm -rf build/ci-artifact
+          mkdir -p build/ci-artifact
+          unzip -q "${{ steps.build.outputs.plugin_zip }}" -d build/ci-artifact
+
+      - name: Upload installable plugin artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifact-name.outputs.name }}
-          path: ${{ steps.build.outputs.plugin_zip }}
+          path: build/ci-artifact
           retention-days: 7
           if-no-files-found: error
