@@ -154,7 +154,7 @@ intellijPlatform {
 
     pluginVerification {
         ides {
-            ide(IntelliJPlatformType.IntellijIdeaCommunity, "2026.1.4")
+            create(IntelliJPlatformType.IntellijIdeaCommunity, "2025.3")
         }
 
         failureLevel.set(
