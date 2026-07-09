@@ -195,12 +195,23 @@ private fun requestTerminalFocus(widget: Any) {
 private fun monitorIdeMode(project: Project, widget: Any) {
     ApplicationManager.getApplication().executeOnPooledThread {
         var codexSessionSeen = false
-        var lastEnableAttemptMillis = 0L
+        var ideContextSeen = false
+        var nextEnableAttemptMillis = 0L
+        var initialEnableDeadlineMillis = System.currentTimeMillis() + CODEX_READY_TIMEOUT_MILLIS
         var missingTextPolls = 0
         val keyActivityTracker = installTerminalKeyActivityTracker(widget)
         try {
             while (!project.isDisposed) {
                 val nowMillis = System.currentTimeMillis()
+                if (!ideContextSeen && nowMillis >= initialEnableDeadlineMillis) {
+                    if (!waitForInitialEnableKeyActivity(project, keyActivityTracker)) {
+                        return@executeOnPooledThread
+                    }
+                    initialEnableDeadlineMillis = System.currentTimeMillis() + CODEX_READY_TIMEOUT_MILLIS
+                    nextEnableAttemptMillis = 0L
+                    continue
+                }
+
                 val terminalText = readTerminalTail(widget, CODEX_MONITOR_TAIL_CHARS)
                 if (terminalText == null) {
                     missingTextPolls += 1
@@ -214,19 +225,22 @@ private fun monitorIdeMode(project: Project, widget: Any) {
                 }
 
                 missingTextPolls = 0
+                val ideContextOn = hasIdeContextIndicator(terminalText)
+                ideContextSeen = ideContextSeen || ideContextOn
                 if (codexTerminalState(terminalText, codexSessionSeen) == CodexTerminalState.READY) {
                     codexSessionSeen = true
-                    if (shouldEnableIdeMode(terminalText, keyActivityTracker, nowMillis, lastEnableAttemptMillis)) {
-                        lastEnableAttemptMillis = nowMillis
-                        tryEnableIdeMode(widget)
+                    if (shouldEnableIdeMode(ideContextOn, ideContextSeen, keyActivityTracker, nowMillis, nextEnableAttemptMillis)) {
+                        val submitted = tryEnableIdeMode(widget)
+                        val retryDelayMillis = if (ideContextSeen && submitted) {
+                            CODEX_IDE_ENABLE_COOLDOWN_MILLIS
+                        } else {
+                            CODEX_IDE_ENABLE_RETRY_MILLIS
+                        }
+                        nextEnableAttemptMillis = System.currentTimeMillis() + retryDelayMillis
                     }
                 }
 
-                val pollMillis = if (codexSessionSeen) {
-                    CODEX_MONITOR_IDLE_POLL_MILLIS
-                } else {
-                    CODEX_READY_POLL_MILLIS
-                }
+                val pollMillis = monitorPollMillis(ideContextSeen, initialEnableDeadlineMillis)
                 if (!waitForNextMonitorCheck(keyActivityTracker, pollMillis)) {
                     return@executeOnPooledThread
                 }
@@ -238,17 +252,51 @@ private fun monitorIdeMode(project: Project, widget: Any) {
     }
 }
 
+private fun waitForInitialEnableKeyActivity(
+    project: Project,
+    keyActivityTracker: TerminalKeyActivityTracker?,
+): Boolean {
+    val baselineKeyPressCount = keyActivityTracker?.keyPressCount() ?: return false
+    while (!project.isDisposed) {
+        val nextKeyPressCount = keyActivityTracker.awaitNextKeyPress(
+            baselineKeyPressCount,
+            CODEX_INITIAL_ENABLE_KEY_WAIT_POLL_MILLIS,
+        )
+        if (nextKeyPressCount != null) {
+            return true
+        }
+    }
+    return false
+}
+
+private fun monitorPollMillis(
+    ideContextSeen: Boolean,
+    initialEnableDeadlineMillis: Long,
+): Long {
+    if (ideContextSeen) {
+        return CODEX_MONITOR_IDLE_POLL_MILLIS
+    }
+    return minOf(
+        CODEX_READY_POLL_MILLIS,
+        (initialEnableDeadlineMillis - System.currentTimeMillis()).coerceAtLeast(1L),
+    )
+}
+
 private fun shouldEnableIdeMode(
-    terminalText: String,
+    ideContextOn: Boolean,
+    ideContextSeen: Boolean,
     keyActivityTracker: TerminalKeyActivityTracker?,
     nowMillis: Long,
-    lastEnableAttemptMillis: Long,
+    nextEnableAttemptMillis: Long,
 ): Boolean {
-    if (hasIdeContextIndicator(terminalText)) {
+    if (ideContextOn) {
         return false
     }
-    if (nowMillis - lastEnableAttemptMillis < CODEX_IDE_ENABLE_COOLDOWN_MILLIS) {
+    if (nowMillis < nextEnableAttemptMillis) {
         return false
+    }
+    if (!ideContextSeen) {
+        return true
     }
     return keyActivityTracker?.isQuiet(nowMillis, CODEX_TERMINAL_INPUT_QUIET_MILLIS) ?: true
 }
@@ -269,10 +317,12 @@ private class TerminalKeyActivityTracker(
 ) : AutoCloseable {
     private val monitor = Object()
     private val lastKeyPressMillis = AtomicLong(0L)
+    private val keyPressCount = AtomicLong(0L)
     private var installed = false
     private val dispatcher = KeyEventDispatcher { event ->
         if (event.id == KeyEvent.KEY_PRESSED && eventWindow(event.component) == window) {
             lastKeyPressMillis.set(System.currentTimeMillis())
+            keyPressCount.incrementAndGet()
             synchronized(monitor) {
                 monitor.notifyAll()
             }
@@ -289,6 +339,26 @@ private class TerminalKeyActivityTracker(
 
     fun isQuiet(nowMillis: Long, quietMillis: Long): Boolean {
         return nowMillis - lastKeyPressMillis.get() >= quietMillis
+    }
+
+    fun keyPressCount(): Long {
+        return keyPressCount.get()
+    }
+
+    fun awaitNextKeyPress(lastObservedCount: Long, delayMillis: Long): Long? {
+        if (keyPressCount.get() > lastObservedCount) {
+            return keyPressCount.get()
+        }
+        return try {
+            synchronized(monitor) {
+                if (keyPressCount.get() <= lastObservedCount) {
+                    monitor.wait(delayMillis)
+                }
+            }
+            keyPressCount.get().takeIf { it > lastObservedCount }
+        } catch (ignored: InterruptedException) {
+            null
+        }
     }
 
     fun awaitOrSleep(delayMillis: Long): Boolean {
@@ -702,8 +772,11 @@ private const val CODEX_MONITOR_TAIL_CHARS = 16000
 private const val CODEX_TERMINAL_MISSING_MAX_POLLS = 80
 private const val CODEX_TERMINAL_INPUT_QUIET_MILLIS = 1000L
 private const val CODEX_IDE_ENABLE_COOLDOWN_MILLIS = 10000L
+private const val CODEX_IDE_ENABLE_RETRY_MILLIS = 1000L
 private const val CODEX_IDE_ENABLE_ECHO_TIMEOUT_MILLIS = 5000L
 private const val CODEX_COMMAND_SUBMIT_DELAY_MILLIS = 250L
+private const val CODEX_READY_TIMEOUT_MILLIS = 180000L
+private const val CODEX_INITIAL_ENABLE_KEY_WAIT_POLL_MILLIS = 1000L
 private const val CODEX_PROMPT_SCAN_LINES = 8
 private const val CODEX_IDE_STATUS_SCAN_LINES = 8
 private val CODEX_READY_PROMPT_REGEX = Regex("(?m)^\\s*(\\x{203a}\\s|Ask Codex\\b)")
