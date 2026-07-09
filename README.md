@@ -3,7 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/noorall/codex-bridge?sort=semver)](https://github.com/noorall/codex-bridge/releases)
 [![CI](https://github.com/noorall/codex-bridge/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/noorall/codex-bridge/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![JetBrains Plugin](https://img.shields.io/badge/JetBrains%20Plugin-2024.3%2B-blue)](src/main/resources/META-INF/plugin.xml)
+[![JetBrains Plugin](https://img.shields.io/badge/JetBrains%20Plugin-2024.3%2B-blue)](https://plugins.jetbrains.com/plugin/32805-codex-cli-bridge)
 [![Java](https://img.shields.io/badge/Java-17-orange)](build.gradle.kts)
 [![Gradle](https://img.shields.io/badge/Gradle-8.14-02303A?logo=gradle)](build.gradle.kts)
 
