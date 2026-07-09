@@ -102,81 +102,90 @@ private fun openIdeTerminal(
         throw IllegalStateException("The JetBrains terminal API does not expose a command execution method")
     }
     if (autoEnableIdeContext) {
-        enableIdeModeWhenReady(project, widget)
+        monitorIdeMode(project, widget)
     }
 }
 
-private fun enableIdeModeWhenReady(project: Project, widget: Any) {
+private fun monitorIdeMode(project: Project, widget: Any) {
     ApplicationManager.getApplication().executeOnPooledThread {
-        if (!waitForCodexReady(project, widget) || project.isDisposed) {
-            return@executeOnPooledThread
-        }
-        ApplicationManager.getApplication().invokeLater {
-            if (!project.isDisposed) {
-                tryEnableIdeMode(widget)
-            }
-        }
-    }
-}
+        var codexSessionSeen = false
+        var lastEnableAttemptMillis = 0L
+        var missingTextPolls = 0
+        val keyActivityTracker = installTerminalKeyActivityTracker(widget)
+        try {
+            while (!project.isDisposed) {
+                val nowMillis = System.currentTimeMillis()
+                val terminalText = readTerminalTail(widget, CODEX_MONITOR_TAIL_CHARS)
+                if (terminalText == null) {
+                    missingTextPolls += 1
+                    if (missingTextPolls >= CODEX_TERMINAL_MISSING_MAX_POLLS) {
+                        return@executeOnPooledThread
+                    }
+                    if (!waitForNextMonitorCheck(keyActivityTracker, CODEX_MONITOR_IDLE_POLL_MILLIS)) {
+                        return@executeOnPooledThread
+                    }
+                    continue
+                }
 
-private fun waitForCodexReady(project: Project, widget: Any): Boolean {
-    val deadlineMillis = AtomicLong(System.currentTimeMillis() + CODEX_READY_TIMEOUT_MILLIS)
-    var nonMainScreenTracker: NonMainScreenKeyActivityTracker? = null
-    try {
-        while (!project.isDisposed) {
-            val nowMillis = System.currentTimeMillis()
-            val terminalState = codexTerminalState(widget)
-            when (terminalState) {
-                CodexTerminalState.NON_MAIN -> {
-                    if (nonMainScreenTracker == null) {
-                        deadlineMillis.set(nowMillis + CODEX_READY_TIMEOUT_MILLIS)
-                        nonMainScreenTracker = installNonMainScreenKeyActivityTracker(widget, deadlineMillis)
+                missingTextPolls = 0
+                if (codexTerminalState(terminalText, codexSessionSeen) == CodexTerminalState.READY) {
+                    codexSessionSeen = true
+                    if (shouldEnableIdeMode(terminalText, keyActivityTracker, nowMillis, lastEnableAttemptMillis)) {
+                        lastEnableAttemptMillis = nowMillis
+                        tryEnableIdeMode(widget)
                     }
                 }
 
-                CodexTerminalState.READY -> {
-                    return true
+                val pollMillis = if (codexSessionSeen) {
+                    CODEX_MONITOR_IDLE_POLL_MILLIS
+                } else {
+                    CODEX_READY_POLL_MILLIS
+                }
+                if (!waitForNextMonitorCheck(keyActivityTracker, pollMillis)) {
+                    return@executeOnPooledThread
                 }
             }
-
-            if (nowMillis >= deadlineMillis.get()) {
-                return false
-            }
-            val pollMillis = minOf(
-                CODEX_READY_POLL_MILLIS,
-                (deadlineMillis.get() - nowMillis).coerceAtLeast(1L),
-            )
-            if (!waitForNextReadyCheck(nonMainScreenTracker, pollMillis)) {
-                return false
-            }
+        } finally {
+            keyActivityTracker?.close()
         }
-        return false
-    } finally {
-        nonMainScreenTracker?.close()
     }
 }
 
-private fun installNonMainScreenKeyActivityTracker(
+private fun shouldEnableIdeMode(
+    terminalText: String,
+    keyActivityTracker: TerminalKeyActivityTracker?,
+    nowMillis: Long,
+    lastEnableAttemptMillis: Long,
+): Boolean {
+    if (hasIdeContextIndicator(terminalText)) {
+        return false
+    }
+    if (nowMillis - lastEnableAttemptMillis < CODEX_IDE_ENABLE_COOLDOWN_MILLIS) {
+        return false
+    }
+    return keyActivityTracker?.isQuiet(nowMillis, CODEX_TERMINAL_INPUT_QUIET_MILLIS) ?: true
+}
+
+private fun installTerminalKeyActivityTracker(
     widget: Any,
-    deadlineMillis: AtomicLong,
-): NonMainScreenKeyActivityTracker? {
+): TerminalKeyActivityTracker? {
     val window = terminalWindow(widget) ?: return null
-    val tracker = NonMainScreenKeyActivityTracker(window, deadlineMillis)
+    val tracker = TerminalKeyActivityTracker(window)
     runOnEdtAndWait {
         tracker.install()
     }
     return tracker
 }
 
-private class NonMainScreenKeyActivityTracker(
+private class TerminalKeyActivityTracker(
     private val window: Window,
-    private val deadlineMillis: AtomicLong,
 ) : AutoCloseable {
     private val monitor = Object()
+    private val lastKeyPressMillis = AtomicLong(0L)
     private var installed = false
     private val dispatcher = KeyEventDispatcher { event ->
         if (event.id == KeyEvent.KEY_PRESSED && eventWindow(event.component) == window) {
-            deadlineMillis.set(System.currentTimeMillis() + CODEX_READY_TIMEOUT_MILLIS)
+            lastKeyPressMillis.set(System.currentTimeMillis())
             synchronized(monitor) {
                 monitor.notifyAll()
             }
@@ -189,6 +198,10 @@ private class NonMainScreenKeyActivityTracker(
             KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(dispatcher)
             installed = true
         }
+    }
+
+    fun isQuiet(nowMillis: Long, quietMillis: Long): Boolean {
+        return nowMillis - lastKeyPressMillis.get() >= quietMillis
     }
 
     fun awaitOrSleep(delayMillis: Long): Boolean {
@@ -210,12 +223,12 @@ private class NonMainScreenKeyActivityTracker(
     }
 }
 
-private fun waitForNextReadyCheck(
-    nonMainScreenTracker: NonMainScreenKeyActivityTracker?,
+private fun waitForNextMonitorCheck(
+    keyActivityTracker: TerminalKeyActivityTracker?,
     delayMillis: Long,
 ): Boolean {
-    return if (nonMainScreenTracker != null) {
-        nonMainScreenTracker.awaitOrSleep(delayMillis)
+    return if (keyActivityTracker != null) {
+        keyActivityTracker.awaitOrSleep(delayMillis)
     } else {
         sleepQuietly(delayMillis)
     }
@@ -249,16 +262,39 @@ private fun runOnEdtAndWait(action: () -> Unit) {
     }
 }
 
-private fun codexTerminalState(widget: Any): CodexTerminalState {
-    val text = readTerminalText(widget) ?: return CodexTerminalState.NON_MAIN
+private fun codexTerminalState(text: String, codexSessionSeen: Boolean): CodexTerminalState {
     val hasCodexSessionText = CODEX_READY_MARKERS.any { marker ->
         text.contains(marker, ignoreCase = true)
     }
-    return if (hasCodexSessionText && CODEX_READY_PROMPT_REGEX.containsMatchIn(text)) {
+    return if ((codexSessionSeen || hasCodexSessionText) && hasCodexReadyPrompt(text)) {
         CodexTerminalState.READY
     } else {
         CodexTerminalState.NON_MAIN
     }
+}
+
+private fun hasCodexReadyPrompt(text: String): Boolean {
+    val recentLines = text.lines()
+        .filter { it.isNotBlank() }
+        .takeLast(CODEX_PROMPT_SCAN_LINES)
+    val promptLineIndex = recentLines.indexOfLast { CODEX_READY_PROMPT_REGEX.containsMatchIn(it) }
+    if (promptLineIndex < 0) {
+        return false
+    }
+    val trailingLines = recentLines.drop(promptLineIndex + 1)
+    return trailingLines.isEmpty() || trailingLines.all { CODEX_STATUS_LINE_REGEX.containsMatchIn(it) }
+}
+
+private fun hasIdeContextIndicator(text: String): Boolean {
+    return text.lines()
+        .filter { it.isNotBlank() }
+        .takeLast(CODEX_IDE_STATUS_SCAN_LINES)
+        .any { CODEX_IDE_CONTEXT_INDICATOR_REGEX.containsMatchIn(it) }
+}
+
+private fun readTerminalTail(widget: Any, maxChars: Int): String? {
+    val text = readTerminalText(widget) ?: return null
+    return if (text.length <= maxChars) text else text.takeLast(maxChars)
 }
 
 private fun readTerminalText(widget: Any): String? {
@@ -290,28 +326,28 @@ private fun sleepQuietly(delayMillis: Long): Boolean {
     }
 }
 
-private fun tryEnableIdeMode(widget: Any) {
-    try {
-        if (!sendTerminalCommand(widget, CODEX_IDE_ENABLE_COMMAND)) {
-            invokeFirstStringMethod(
-                widget,
-                listOf("executeCommand", "sendCommandToExecute"),
-                CODEX_IDE_ENABLE_COMMAND,
-            )
-        }
+private fun tryEnableIdeMode(widget: Any): Boolean {
+    return try {
+        sendTerminalCommand(widget, CODEX_IDE_ENABLE_COMMAND, CODEX_IDE_ENABLE_ECHO_TIMEOUT_MILLIS) ||
+            executeTerminalCommand(widget, CODEX_IDE_ENABLE_COMMAND)
     } catch (ignored: Throwable) {
         // If terminal injection fails, the Codex session is still usable and /ide can be run manually.
+        false
     }
 }
 
-private fun sendTerminalCommand(widget: Any, command: String): Boolean {
+private fun sendTerminalCommand(
+    widget: Any,
+    command: String,
+    echoTimeoutMillis: Long,
+): Boolean {
     if (sendRawTerminalInput(widget, command)) {
-        return submitTerminalCommandAfterEcho(widget, command) {
+        return submitTerminalCommandAfterEcho(widget, command, echoTimeoutMillis) {
             sendRawTerminalInput(widget, TERMINAL_ENTER_INPUT) || sendTerminalEnterKey(widget)
         }
     }
     if (sendWithTerminalStarter(widget, command)) {
-        return submitTerminalCommandAfterEcho(widget, command) {
+        return submitTerminalCommandAfterEcho(widget, command, echoTimeoutMillis) {
             sendWithTerminalStarter(widget, TERMINAL_ENTER_INPUT) || sendTerminalEnterKey(widget)
         }
     }
@@ -321,9 +357,10 @@ private fun sendTerminalCommand(widget: Any, command: String): Boolean {
 private fun submitTerminalCommandAfterEcho(
     widget: Any,
     command: String,
+    echoTimeoutMillis: Long,
     submit: () -> Boolean,
 ): Boolean {
-    if (!waitForTerminalText(widget, command, CODEX_READY_TIMEOUT_MILLIS)) {
+    if (!waitForTerminalText(widget, command, echoTimeoutMillis)) {
         return false
     }
     if (!sleepQuietly(CODEX_COMMAND_SUBMIT_DELAY_MILLIS)) {
@@ -359,6 +396,14 @@ private fun sendWithTerminalStarter(widget: Any, text: String): Boolean {
 }
 
 private fun sendTerminalEnterKey(widget: Any): Boolean {
+    val result = AtomicReference(false)
+    runOnEdtAndWait {
+        result.set(sendTerminalEnterKeyOnEdt(widget))
+    }
+    return result.get()
+}
+
+private fun sendTerminalEnterKeyOnEdt(widget: Any): Boolean {
     val target = findTerminalKeyTarget(widget) ?: return false
     val component = (target as? Component) ?: findComponent(target) ?: return false
     val event = KeyEvent(
@@ -384,6 +429,20 @@ private fun sendTerminalEnterKey(widget: Any): Boolean {
         ),
     )
     return true
+}
+
+private fun executeTerminalCommand(widget: Any, command: String): Boolean {
+    val result = AtomicReference(false)
+    runOnEdtAndWait {
+        result.set(
+            invokeFirstStringMethod(
+                widget,
+                listOf("executeCommand", "sendCommandToExecute"),
+                command,
+            ),
+        )
+    }
+    return result.get()
 }
 
 private fun findTerminalKeyTarget(widget: Any): Any? {
@@ -550,9 +609,18 @@ private enum class CodexTerminalState {
 private const val CODEX_IDE_ENABLE_COMMAND = "/ide on"
 private const val TERMINAL_ENTER_INPUT = "\r"
 private const val CODEX_READY_POLL_MILLIS = 250L
+private const val CODEX_MONITOR_IDLE_POLL_MILLIS = 1500L
+private const val CODEX_MONITOR_TAIL_CHARS = 16000
+private const val CODEX_TERMINAL_MISSING_MAX_POLLS = 80
+private const val CODEX_TERMINAL_INPUT_QUIET_MILLIS = 1000L
+private const val CODEX_IDE_ENABLE_COOLDOWN_MILLIS = 10000L
+private const val CODEX_IDE_ENABLE_ECHO_TIMEOUT_MILLIS = 5000L
 private const val CODEX_COMMAND_SUBMIT_DELAY_MILLIS = 250L
-private const val CODEX_READY_TIMEOUT_MILLIS = 180000L
+private const val CODEX_PROMPT_SCAN_LINES = 8
+private const val CODEX_IDE_STATUS_SCAN_LINES = 8
 private val CODEX_READY_PROMPT_REGEX = Regex("(?m)^\\s*(\\x{203a}\\s|Ask Codex\\b)")
+private val CODEX_STATUS_LINE_REGEX = Regex("\\s\\u00b7\\s|\\bIDE context\\b", RegexOption.IGNORE_CASE)
+private val CODEX_IDE_CONTEXT_INDICATOR_REGEX = Regex("\\bIDE context\\b", RegexOption.IGNORE_CASE)
 private val CODEX_READY_MARKERS = listOf(
     "OpenAI Codex",
     "/model to change",
