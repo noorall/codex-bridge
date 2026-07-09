@@ -62,19 +62,32 @@ class LaunchCodexAction : AnAction() {
             return
         }
 
-        val terminalCommand = buildTerminalCommand(command, tmpDir, project.basePath)
+        val terminalLaunch = buildTerminalLaunch(command, tmpDir, project.basePath)
         try {
-            openIdeTerminal(project, terminalCommand, autoEnableIdeContext)
+            openIdeTerminal(project, terminalLaunch, autoEnableIdeContext)
         } catch (error: Throwable) {
             Messages.showErrorDialog(project, "Could not open the JetBrains terminal:\n${error.message}", "Codex")
         }
     }
 }
 
-private fun buildTerminalCommand(command: String, tmpDir: Path, basePath: String?): String {
+private data class TerminalLaunch(
+    val fallbackCommand: String,
+    val directCommand: List<String>?,
+    val workingDirectory: String,
+    val env: Map<String, String>,
+)
+
+private fun buildTerminalLaunch(command: String, tmpDir: Path, basePath: String?): TerminalLaunch {
     val codexCommand = command.ifBlank { DEFAULT_CODEX_COMMAND }
+    val workingDirectory = basePath ?: System.getProperty("user.home")
+    val env = mapOf(
+        "TMPDIR" to tmpDir.toString(),
+        "CODEX_JETBRAINS_TMPDIR" to tmpDir.toString(),
+    )
+    val directCommand = parseDirectCommand(codexCommand)
     if (isWindows()) {
-        return codexCommand
+        return TerminalLaunch(codexCommand, directCommand, workingDirectory, env)
     }
 
     val parts = mutableListOf<String>()
@@ -85,16 +98,97 @@ private fun buildTerminalCommand(command: String, tmpDir: Path, basePath: String
     }
     parts += CLEAR_TERMINAL_COMMAND
     parts += codexCommand
-    return parts.joinToString("; ")
+    return TerminalLaunch(parts.joinToString("; "), directCommand, workingDirectory, env)
 }
 
 private fun shellQuote(value: String): String {
     return "'" + value.replace("'", "'\"'\"'") + "'"
 }
 
+private fun parseDirectCommand(command: String): List<String>? {
+    if (command.isBlank()) {
+        return null
+    }
+
+    val windows = isWindows()
+    val tokens = mutableListOf<String>()
+    val current = StringBuilder()
+    var quote: Char? = null
+    var escaped = false
+    var tokenStarted = false
+    for (char in command) {
+        if (escaped) {
+            current.append(char)
+            escaped = false
+            tokenStarted = true
+            continue
+        }
+
+        when {
+            char == '\\' && !windows && quote != '\'' -> {
+                escaped = true
+                tokenStarted = true
+            }
+
+            quote != null -> {
+                if (char == quote) {
+                    quote = null
+                } else {
+                    current.append(char)
+                }
+                tokenStarted = true
+            }
+
+            char == '\'' || char == '"' -> {
+                quote = char
+                tokenStarted = true
+            }
+
+            char.isWhitespace() -> {
+                if (tokenStarted) {
+                    tokens += current.toString()
+                    current.clear()
+                    tokenStarted = false
+                }
+            }
+
+            char in DIRECT_COMMAND_UNSUPPORTED_CHARS -> return null
+
+            else -> {
+                current.append(char)
+                tokenStarted = true
+            }
+        }
+    }
+
+    if (escaped || quote != null) {
+        return null
+    }
+    if (tokenStarted) {
+        tokens += current.toString()
+    }
+
+    val executable = tokens.firstOrNull() ?: return null
+    if (!windows && isShellEnvironmentAssignment(executable)) {
+        return null
+    }
+    return tokens
+}
+
+private fun isShellEnvironmentAssignment(token: String): Boolean {
+    val separatorIndex = token.indexOf('=')
+    if (separatorIndex <= 0) {
+        return false
+    }
+
+    val name = token.take(separatorIndex)
+    return name.first().let { it == '_' || it.isLetter() } &&
+        name.all { it == '_' || it.isLetterOrDigit() }
+}
+
 private fun openIdeTerminal(
     project: Project,
-    command: String,
+    launch: TerminalLaunch,
     autoEnableIdeContext: Boolean,
 ) {
     val managerClass = Class.forName("org.jetbrains.plugins.terminal.TerminalToolWindowManager")
@@ -107,9 +201,17 @@ private fun openIdeTerminal(
         forgetCodexTerminal(project, existingSession)
     }
 
-    val workingDirectory = project.basePath ?: System.getProperty("user.home")
-    val widget = createTerminalWidget(manager, workingDirectory)
-    if (!invokeFirstStringMethod(widget, listOf("sendCommandToExecute", "executeCommand"), command)) {
+    val reworkedSession = createReworkedTerminalSession(project, launch)
+    if (reworkedSession != null) {
+        rememberCodexTerminal(project, reworkedSession)
+        if (autoEnableIdeContext) {
+            monitorIdeMode(project, reworkedSession.widget)
+        }
+        return
+    }
+
+    val widget = createTerminalWidget(manager, launch.workingDirectory)
+    if (!invokeFirstStringMethod(widget, listOf("sendCommandToExecute", "executeCommand"), launch.fallbackCommand)) {
         throw IllegalStateException("The JetBrains terminal API does not expose a command execution method")
     }
     rememberCodexTerminal(project, CodexTerminalSession(widget, findTerminalContent(manager, widget)))
@@ -159,6 +261,67 @@ private fun projectTerminalKey(project: Project): String {
     return project.locationHash.ifBlank {
         project.basePath ?: project.name
     }
+}
+
+private fun createReworkedTerminalSession(
+    project: Project,
+    launch: TerminalLaunch,
+): CodexTerminalSession? {
+    val directCommand = launch.directCommand ?: return null
+    val result = AtomicReference<CodexTerminalSession?>()
+    runOnEdtAndWait {
+        try {
+            result.set(createReworkedTerminalSessionOnEdt(project, launch, directCommand))
+        } catch (ignored: Throwable) {
+            result.set(null)
+        }
+    }
+    return result.get()
+}
+
+private fun createReworkedTerminalSessionOnEdt(
+    project: Project,
+    launch: TerminalLaunch,
+    directCommand: List<String>,
+): CodexTerminalSession? {
+    val tabsManagerClass = try {
+        Class.forName(REWORKED_TERMINAL_TABS_MANAGER_CLASS)
+    } catch (ignored: Throwable) {
+        return null
+    }
+    val tabsManager = try {
+        tabsManagerClass.getMethod("getInstance", Project::class.java).invoke(null, project)
+    } catch (ignored: Throwable) {
+        return null
+    } ?: return null
+
+    val builder = invokeNoArgMethod(tabsManager, "createTabBuilder") ?: return null
+    if (!invokeMethodIfPresent(builder, "workingDirectory", arrayOf(launch.workingDirectory))) {
+        return null
+    }
+    if (!invokeMethodIfPresent(builder, "shellCommand", arrayOf(directCommand))) {
+        return null
+    }
+    invokeMethodIfPresent(builder, "envVariables", arrayOf(launch.env))
+    invokeMethodIfPresent(builder, "tabName", arrayOf(CODEX_TERMINAL_TITLE))
+    invokeMethodIfPresent(builder, "requestFocus", arrayOf(true))
+    reworkedTerminalProcessType("NON_SHELL")?.let { processType ->
+        invokeMethodIfPresent(builder, "processType", arrayOf(processType))
+    }
+
+    val tab = invokeNoArgMethod(builder, "createTab") ?: return null
+    val view = invokeNoArgMethod(tab, "getView") ?: return null
+    val content = invokeNoArgMethod(tab, "getContent")
+    return CodexTerminalSession(view, content)
+}
+
+private fun reworkedTerminalProcessType(name: String): Any? {
+    val processTypeClass = try {
+        Class.forName(REWORKED_TERMINAL_PROCESS_TYPE_CLASS)
+    } catch (ignored: Throwable) {
+        return null
+    }
+    return processTypeClass.enumConstants?.firstOrNull { (it as? Enum<*>)?.name == name }
 }
 
 private fun refreshTerminalSession(
@@ -552,17 +715,27 @@ private fun readTerminalText(widget: Any): String? {
     return try {
         val app = ApplicationManager.getApplication()
         if (app.isDispatchThread) {
-            invokeNoArgMethod(widget, "getText") as? String
+            readTerminalViewTextOnEdt(widget) ?: invokeNoArgMethod(widget, "getText") as? String
         } else {
             val text = AtomicReference<String?>()
             app.invokeAndWait {
-                text.set(invokeNoArgMethod(widget, "getText") as? String)
+                text.set(readTerminalViewTextOnEdt(widget) ?: invokeNoArgMethod(widget, "getText") as? String)
             }
             text.get()
         }
     } catch (ignored: Throwable) {
         null
     }
+}
+
+private fun readTerminalViewTextOnEdt(widget: Any): String? {
+    val outputModels = invokeNoArgMethod(widget, "getOutputModels") ?: return null
+    val activeFlow = invokeNoArgMethod(outputModels, "getActive") ?: return null
+    val outputModel = invokeNoArgMethod(activeFlow, "getValue") ?: return null
+    val snapshot = invokeNoArgMethod(outputModel, "takeSnapshot") ?: return null
+    val startOffset = invokeNoArgMethod(snapshot, "getStartOffset") ?: return null
+    val endOffset = invokeNoArgMethod(snapshot, "getEndOffset") ?: return null
+    return invokeMethod(snapshot, "getText", arrayOf(startOffset, endOffset))?.toString()
 }
 
 private fun sleepQuietly(delayMillis: Long): Boolean {
@@ -592,6 +765,9 @@ private fun sendTerminalCommand(
     command: String,
     echoTimeoutMillis: Long,
 ): Boolean {
+    if (sendTerminalViewCommand(widget, command)) {
+        return true
+    }
     if (sendRawTerminalInput(widget, command)) {
         return submitTerminalCommandAfterEcho(widget, command, echoTimeoutMillis) {
             sendRawTerminalInput(widget, TERMINAL_ENTER_INPUT) || sendTerminalEnterKey(widget)
@@ -603,6 +779,15 @@ private fun sendTerminalCommand(
         }
     }
     return false
+}
+
+private fun sendTerminalViewCommand(widget: Any, command: String): Boolean {
+    val builder = invokeNoArgMethod(widget, "createSendTextBuilder") ?: return false
+    invokeMethodIfPresent(builder, "useBracketedPasteMode", arrayOf<Any?>())
+    if (!invokeMethodIfPresent(builder, "shouldExecute", arrayOf<Any?>())) {
+        invokeMethodIfPresent(builder, "shouldExecute", arrayOf(true))
+    }
+    return invokeMethodIfPresent(builder, "send", arrayOf(command))
 }
 
 private fun submitTerminalCommandAfterEcho(
@@ -883,6 +1068,10 @@ private const val CODEX_READY_TIMEOUT_MILLIS = 180000L
 private const val CODEX_INITIAL_ENABLE_KEY_WAIT_POLL_MILLIS = 1000L
 private const val CODEX_PROMPT_SCAN_LINES = 8
 private const val CODEX_IDE_STATUS_SCAN_LINES = 8
+private const val REWORKED_TERMINAL_TABS_MANAGER_CLASS =
+    "com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager"
+private const val REWORKED_TERMINAL_PROCESS_TYPE_CLASS = "org.jetbrains.plugins.terminal.startup.TerminalProcessType"
+private val DIRECT_COMMAND_UNSUPPORTED_CHARS = setOf(';', '|', '&', '<', '>', '(', ')', '{', '}', '*', '?', '~', '$', '`')
 private val CODEX_READY_PROMPT_REGEX = Regex("(?m)^\\s*(\\x{203a}\\s|Ask Codex\\b)")
 private val CODEX_STATUS_LINE_REGEX = Regex("\\s\\u00b7\\s|\\bIDE context\\b", RegexOption.IGNORE_CASE)
 private val CODEX_IDE_CONTEXT_INDICATOR_REGEX = Regex("\\bIDE context\\b", RegexOption.IGNORE_CASE)
