@@ -30,10 +30,14 @@ import java.awt.event.KeyEvent
 import java.lang.reflect.Method
 import java.nio.charset.StandardCharsets
 import java.nio.file.Path
+import java.util.Collections
+import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.function.Consumer
 import javax.swing.SwingUtilities
+
+private val activeCodexTerminals = Collections.synchronizedMap(WeakHashMap<Project, Any>())
 
 class LaunchCodexAction : AnAction() {
     override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
@@ -96,14 +100,96 @@ private fun openIdeTerminal(
     val managerClass = Class.forName("org.jetbrains.plugins.terminal.TerminalToolWindowManager")
     val manager = managerClass.getMethod("getInstance", Project::class.java)
         .invoke(null, project)
+    findReusableCodexTerminal(project, manager)?.let { existingWidget ->
+        if (activateCodexTerminal(manager, existingWidget)) {
+            return
+        }
+        forgetCodexTerminal(project, existingWidget)
+    }
+
     val workingDirectory = project.basePath ?: System.getProperty("user.home")
     val widget = createTerminalWidget(manager, workingDirectory)
     if (!invokeFirstStringMethod(widget, listOf("sendCommandToExecute", "executeCommand"), command)) {
         throw IllegalStateException("The JetBrains terminal API does not expose a command execution method")
     }
+    rememberCodexTerminal(project, widget)
     if (autoEnableIdeContext) {
         monitorIdeMode(project, widget)
     }
+}
+
+private fun findReusableCodexTerminal(project: Project, manager: Any): Any? {
+    registeredCodexTerminal(project)?.let { widget ->
+        if (isOpenTerminalWidget(manager, widget)) {
+            return widget
+        }
+        forgetCodexTerminal(project, widget)
+    }
+    return null
+}
+
+private fun registeredCodexTerminal(project: Project): Any? {
+    return synchronized(activeCodexTerminals) {
+        activeCodexTerminals[project]
+    }
+}
+
+private fun rememberCodexTerminal(project: Project, widget: Any) {
+    synchronized(activeCodexTerminals) {
+        activeCodexTerminals[project] = widget
+    }
+}
+
+private fun forgetCodexTerminal(project: Project, widget: Any) {
+    synchronized(activeCodexTerminals) {
+        if (activeCodexTerminals[project] === widget) {
+            activeCodexTerminals.remove(project)
+        }
+    }
+}
+
+private fun isOpenTerminalWidget(manager: Any, widget: Any): Boolean {
+    val content = terminalContent(manager, widget) ?: return false
+    return invokeNoArgMethod(content, "isValid") as? Boolean ?: true
+}
+
+private fun terminalContent(manager: Any, widget: Any): Any? {
+    val container = invokeMethod(manager, "getContainer", arrayOf(widget)) ?: return null
+    return invokeNoArgMethod(container, "getContent")
+}
+
+private fun activateCodexTerminal(manager: Any, widget: Any): Boolean {
+    val toolWindow = invokeNoArgMethod(manager, "getToolWindow") ?: return false
+    val content = terminalContent(manager, widget) ?: return false
+    val activated = AtomicReference(false)
+    runOnEdtAndWait {
+        val contentManager = invokeNoArgMethod(toolWindow, "getContentManager")
+        if (contentManager != null) {
+            if (!invokeMethodIfPresent(contentManager, "setSelectedContent", arrayOf(content, true))) {
+                invokeMethodIfPresent(contentManager, "setSelectedContent", arrayOf(content))
+            }
+        }
+
+        val focusTerminal = Runnable { requestTerminalFocus(widget) }
+        val didActivate = invokeMethodIfPresent(toolWindow, "activate", arrayOf(focusTerminal, true, true)) ||
+            invokeMethodIfPresent(toolWindow, "activate", arrayOf(focusTerminal, true)) ||
+            invokeMethodIfPresent(toolWindow, "activate", arrayOf(focusTerminal)) ||
+            invokeMethodIfPresent(toolWindow, "show", arrayOf(focusTerminal)) ||
+            invokeMethodIfPresent(toolWindow, "show", arrayOf<Any?>())
+        if (!didActivate) {
+            requestTerminalFocus(widget)
+        }
+        activated.set(true)
+    }
+    return activated.get()
+}
+
+private fun requestTerminalFocus(widget: Any) {
+    invokeNoArgMethod(widget, "requestFocus")
+    terminalKeyTargetCandidates(widget)
+        .filterIsInstance<Component>()
+        .firstOrNull { it.isShowing }
+        ?.requestFocusInWindow()
 }
 
 private fun monitorIdeMode(project: Project, widget: Any) {
@@ -147,6 +233,7 @@ private fun monitorIdeMode(project: Project, widget: Any) {
             }
         } finally {
             keyActivityTracker?.close()
+            forgetCodexTerminal(project, widget)
         }
     }
 }
@@ -529,10 +616,10 @@ private fun writeToTtyConnector(connector: Any, payload: String) {
 
 private fun createTerminalWidget(manager: Any, workingDirectory: String): Any {
     val attempts = listOf(
-        TerminalMethodCall("createLocalShellWidget", arrayOf(workingDirectory, "Codex")),
-        TerminalMethodCall("createLocalShellWidget", arrayOf(workingDirectory, "Codex", true)),
-        TerminalMethodCall("createShellWidget", arrayOf(workingDirectory, "Codex", true, true)),
-        TerminalMethodCall("createShellWidget", arrayOf(workingDirectory, "Codex", true)),
+        TerminalMethodCall("createLocalShellWidget", arrayOf(workingDirectory, CODEX_TERMINAL_TITLE)),
+        TerminalMethodCall("createLocalShellWidget", arrayOf(workingDirectory, CODEX_TERMINAL_TITLE, true)),
+        TerminalMethodCall("createShellWidget", arrayOf(workingDirectory, CODEX_TERMINAL_TITLE, true, true)),
+        TerminalMethodCall("createShellWidget", arrayOf(workingDirectory, CODEX_TERMINAL_TITLE, true)),
     )
 
     for (attempt in attempts) {
@@ -606,6 +693,7 @@ private enum class CodexTerminalState {
     READY,
 }
 
+private const val CODEX_TERMINAL_TITLE = "Codex"
 private const val CODEX_IDE_ENABLE_COMMAND = "/ide on"
 private const val TERMINAL_ENTER_INPUT = "\r"
 private const val CODEX_READY_POLL_MILLIS = 250L
