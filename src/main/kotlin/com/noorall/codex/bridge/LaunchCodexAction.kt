@@ -28,6 +28,7 @@ import java.awt.KeyboardFocusManager
 import java.awt.Window
 import java.awt.event.KeyEvent
 import java.lang.reflect.Method
+import java.lang.reflect.Modifier
 import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import java.util.Collections
@@ -111,7 +112,7 @@ private fun openIdeTerminal(
     if (!invokeFirstStringMethod(widget, listOf("sendCommandToExecute", "executeCommand"), command)) {
         throw IllegalStateException("The JetBrains terminal API does not expose a command execution method")
     }
-    rememberCodexTerminal(project, CodexTerminalSession(widget, terminalContent(manager, widget)))
+    rememberCodexTerminal(project, CodexTerminalSession(widget, findTerminalContent(manager, widget)))
     if (autoEnableIdeContext) {
         monitorIdeMode(project, widget)
     }
@@ -124,10 +125,11 @@ private data class CodexTerminalSession(
 
 private fun findReusableCodexTerminal(project: Project, manager: Any): CodexTerminalSession? {
     registeredCodexTerminal(project)?.let { session ->
-        if (isOpenTerminalSession(manager, session)) {
-            return session
+        val refreshedSession = refreshTerminalSession(project, manager, session)
+        if (isOpenTerminalSession(manager, refreshedSession)) {
+            return refreshedSession
         }
-        forgetCodexTerminal(project, session)
+        forgetCodexTerminal(project, refreshedSession)
     }
     return null
 }
@@ -159,8 +161,22 @@ private fun projectTerminalKey(project: Project): String {
     }
 }
 
+private fun refreshTerminalSession(
+    project: Project,
+    manager: Any,
+    session: CodexTerminalSession,
+): CodexTerminalSession {
+    if (session.content != null) {
+        return session
+    }
+    val content = findTerminalContent(manager, session.widget) ?: return session
+    return session.copy(content = content).also { refreshedSession ->
+        rememberCodexTerminal(project, refreshedSession)
+    }
+}
+
 private fun isOpenTerminalSession(manager: Any, session: CodexTerminalSession): Boolean {
-    val content = session.content ?: terminalContent(manager, session.widget) ?: return false
+    val content = session.content ?: findTerminalContent(manager, session.widget) ?: return false
     return isValidTerminalContent(manager, content)
 }
 
@@ -180,9 +196,66 @@ private fun terminalContent(manager: Any, widget: Any): Any? {
     return invokeNoArgMethod(container, "getContent")
 }
 
+private fun findTerminalContent(manager: Any, widget: Any): Any? {
+    val result = AtomicReference<Any?>()
+    runOnEdtAndWait {
+        result.set(terminalContent(manager, widget) ?: findTerminalContentInToolWindow(manager, widget))
+    }
+    return result.get()
+}
+
+private fun findTerminalContentInToolWindow(manager: Any, widget: Any): Any? {
+    val toolWindow = invokeNoArgMethod(manager, "getToolWindow") ?: return null
+    val contentManager = invokeNoArgMethod(toolWindow, "getContentManager") ?: return null
+    return contentItems(contentManager).firstOrNull { content ->
+        terminalContentMatchesWidget(manager, content, widget)
+    }
+}
+
+private fun contentItems(contentManager: Any): List<Any> {
+    return when (val contents = invokeNoArgMethod(contentManager, "getContents")) {
+        is Array<*> -> contents.filterNotNull()
+        is Iterable<*> -> contents.filterNotNull()
+        else -> emptyList()
+    }
+}
+
+private fun terminalContentMatchesWidget(manager: Any, content: Any, widget: Any): Boolean {
+    val contentWidget = invokeStaticMethod(manager.javaClass, "findWidgetByContent", arrayOf(content))
+        ?: invokeStaticMethod(manager.javaClass, "getWidgetByContent", arrayOf(content))
+        ?: return false
+    return widgetsReferToSameTerminal(contentWidget, widget)
+}
+
+private fun widgetsReferToSameTerminal(left: Any, right: Any): Boolean {
+    if (left === right) {
+        return true
+    }
+
+    val leftAsNewWidget = invokeNoArgMethod(left, "asNewWidget")
+    val rightAsNewWidget = invokeNoArgMethod(right, "asNewWidget")
+    if (leftAsNewWidget != null && leftAsNewWidget === right) {
+        return true
+    }
+    if (rightAsNewWidget != null && rightAsNewWidget === left) {
+        return true
+    }
+    if (leftAsNewWidget != null && rightAsNewWidget != null && leftAsNewWidget === rightAsNewWidget) {
+        return true
+    }
+
+    return terminalComponents(left).any { leftComponent ->
+        terminalComponents(right).any { rightComponent -> leftComponent === rightComponent }
+    }
+}
+
+private fun terminalComponents(widget: Any): List<Component> {
+    return terminalKeyTargetCandidates(widget).filterIsInstance<Component>()
+}
+
 private fun activateCodexTerminal(manager: Any, session: CodexTerminalSession): Boolean {
     val toolWindow = invokeNoArgMethod(manager, "getToolWindow") ?: return false
-    val content = session.content ?: terminalContent(manager, session.widget) ?: return false
+    val content = session.content ?: findTerminalContent(manager, session.widget) ?: return false
     val activated = AtomicReference(false)
     runOnEdtAndWait {
         val contentManager = invokeNoArgMethod(toolWindow, "getContentManager")
@@ -741,6 +814,16 @@ private fun invokeMethod(target: Any, name: String, args: Array<Any?>): Any? {
         it.name == name && it.parameterCount == args.size && parametersAccept(it, args)
     } ?: return null
     return method.invoke(target, *args)
+}
+
+private fun invokeStaticMethod(targetClass: Class<*>, name: String, args: Array<Any?>): Any? {
+    val method = targetClass.methods.firstOrNull {
+        Modifier.isStatic(it.modifiers) &&
+            it.name == name &&
+            it.parameterCount == args.size &&
+            parametersAccept(it, args)
+    } ?: return null
+    return method.invoke(null, *args)
 }
 
 private fun invokeMethodIfPresent(target: Any, name: String, args: Array<Any?>): Boolean {
