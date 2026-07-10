@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Show the live Codex IDE context in the project status bar with selection preview, active file, open tabs, and last-sent time.
+
+### Fixed
+
+- Stop Codex session monitoring and hide the context widget when the terminal process exits.
+
 ## [0.1.0] - 2026-07-08
 
 ### Added

@@ -15,6 +15,9 @@
             <p style="margin: 0 0 8px 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
                 &#8226;&nbsp;Enable Codex /ide context automatically after the Codex terminal is ready.
             </p>
+            <p style="margin: 0 0 8px 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
+                &#8226;&nbsp;Inspect the active Codex IDE context from the project status bar.
+            </p>
             <p style="margin: 10px 0 4px 0;"><b>Configuration</b></p>
             <p style="max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;">
                 Configure the Codex command and IDE context behavior in Settings | Tools | Codex CLI Bridge.
@@ -36,6 +39,9 @@
                 parentId="tools"
                 instance="com.noorall.codex.bridge.CodexSettingsConfigurable"
                 displayName="Codex CLI Bridge"/>
+        <statusBarWidgetFactory
+                id="CodexIdeContext"
+                implementation="com.noorall.codex.bridge.CodexContextStatusBarWidgetFactory"/>
     </extensions>
 
     <actions>

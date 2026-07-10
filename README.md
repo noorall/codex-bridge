@@ -23,6 +23,8 @@ The plugin keeps Codex CLI as the agent host in the terminal. JetBrains provides
 - multiple selection ranges when the editor has multiple selected carets
 - open editor tabs
 
+While the Codex terminal session is running, the IDE status bar shows the current selected file and line range. Click it to inspect the selected code, active file, open tabs, and the time Codex last requested the context. Selecting another range replaces the displayed range, and closing Codex removes the widget.
+
 ## Build
 
 Open the project as a Gradle project in IntelliJ IDEA and run:

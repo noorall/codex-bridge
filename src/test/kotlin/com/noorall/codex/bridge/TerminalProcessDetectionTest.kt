@@ -13,6 +13,7 @@
  */
 package com.noorall.codex.bridge
 
+import com.noorall.codex.bridge.fixture.hiddenTerminalWidget
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -24,11 +25,11 @@ class TerminalProcessDetectionTest {
     fun `detects command state from modern terminal widget`() {
         assertEquals(
             TerminalProcessState.RUNNING,
-            detectTerminalProcessState(ModernTerminalWidget(true), directProcess = false),
+            detectTerminalProcessState(ModernTerminalWidget(true)),
         )
         assertEquals(
             TerminalProcessState.STOPPED,
-            detectTerminalProcessState(ModernTerminalWidget(false), directProcess = false),
+            detectTerminalProcessState(ModernTerminalWidget(false)),
         )
     }
 
@@ -36,27 +37,27 @@ class TerminalProcessDetectionTest {
     fun `detects command state from classic terminal widget`() {
         assertEquals(
             TerminalProcessState.RUNNING,
-            detectTerminalProcessState(ClassicTerminalWidget(true), directProcess = false),
+            detectTerminalProcessState(ClassicTerminalWidget(true)),
         )
         assertEquals(
             TerminalProcessState.STOPPED,
-            detectTerminalProcessState(ClassicTerminalWidget(false), directProcess = false),
+            detectTerminalProcessState(ClassicTerminalWidget(false)),
         )
     }
 
     @Test
-    fun `detects direct process state from terminal view`() {
+    fun `detects command state from reworked terminal shell integration`() {
         assertEquals(
             TerminalProcessState.RUNNING,
-            detectTerminalProcessState(TerminalView("Running"), directProcess = true),
-        )
-        assertEquals(
-            TerminalProcessState.RUNNING,
-            detectTerminalProcessState(TerminalView("NotStarted"), directProcess = true),
+            detectTerminalProcessState(TerminalView("ExecutingCommand")),
         )
         assertEquals(
             TerminalProcessState.STOPPED,
-            detectTerminalProcessState(TerminalView("Terminated"), directProcess = true),
+            detectTerminalProcessState(TerminalView("TypingCommand")),
+        )
+        assertEquals(
+            TerminalProcessState.UNKNOWN,
+            detectTerminalProcessState(TerminalView("WaitingForPrompt")),
         )
     }
 
@@ -64,7 +65,7 @@ class TerminalProcessDetectionTest {
     fun `checks the new widget adapter when present`() {
         assertEquals(
             TerminalProcessState.STOPPED,
-            detectTerminalProcessState(WidgetAdapter(ModernTerminalWidget(false)), directProcess = false),
+            detectTerminalProcessState(WidgetAdapter(ModernTerminalWidget(false))),
         )
     }
 
@@ -72,8 +73,26 @@ class TerminalProcessDetectionTest {
     fun `keeps unknown terminal implementations reusable`() {
         assertEquals(
             TerminalProcessState.UNKNOWN,
-            detectTerminalProcessState(Any(), directProcess = false),
+            detectTerminalProcessState(Any()),
         )
+    }
+
+    @Test
+    fun `invokes a public interface method implemented by a nonpublic class`() {
+        assertEquals(
+            TerminalProcessState.RUNNING,
+            detectTerminalProcessState(hiddenTerminalWidget(running = true)),
+        )
+    }
+
+    @Test
+    fun `tracks a stopped process only after it was running`() {
+        val tracker = TerminalProcessTracker()
+
+        assertEquals(TerminalProcessState.UNKNOWN, tracker.observe(TerminalProcessState.STOPPED))
+        assertEquals(TerminalProcessState.RUNNING, tracker.observe(TerminalProcessState.RUNNING))
+        assertEquals(TerminalProcessState.STOPPED, tracker.observe(TerminalProcessState.STOPPED))
+        assertEquals(TerminalProcessState.STOPPED, tracker.observe(TerminalProcessState.RUNNING))
     }
 
     @Test
@@ -99,6 +118,18 @@ class TerminalProcessDetectionTest {
         assertTrue(task.isCancelled)
     }
 
+    @Test
+    fun `a monitor task attached after monitor completion is cancelled`() {
+        val monitorControl = TerminalMonitorControl()
+        val task = FutureTask<Unit> {}
+
+        monitorControl.completed()
+        monitorControl.attach(task)
+
+        assertFalse(monitorControl.isActive())
+        assertTrue(task.isCancelled)
+    }
+
     private class ModernTerminalWidget(private val running: Boolean) {
         fun isCommandRunning(): Boolean = running
     }
@@ -112,9 +143,21 @@ class TerminalProcessDetectionTest {
     }
 
     private class TerminalView(state: String) {
-        private val stateFlow = StateFlow(NamedState(state))
+        private val shellIntegrationDeferred = CompletedDeferred(ShellIntegration(state))
 
-        fun getSessionState(): StateFlow = stateFlow
+        fun getShellIntegrationDeferred(): CompletedDeferred = shellIntegrationDeferred
+    }
+
+    private class CompletedDeferred(private val value: Any) {
+        fun isCompleted(): Boolean = true
+
+        fun getCompleted(): Any = value
+    }
+
+    private class ShellIntegration(state: String) {
+        private val outputStatus = StateFlow(NamedState(state))
+
+        fun getOutputStatus(): StateFlow = outputStatus
     }
 
     private class StateFlow(private val state: Any) {

@@ -31,6 +31,7 @@ import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.nio.charset.StandardCharsets
 import java.nio.file.Path
+import java.util.ArrayDeque
 import java.util.Collections
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
@@ -74,8 +75,8 @@ class LaunchCodexAction : AnAction() {
 }
 
 private data class TerminalLaunch(
+    val command: String,
     val fallbackCommand: String,
-    val directCommand: List<String>?,
     val workingDirectory: String,
     val env: Map<String, String>,
 )
@@ -87,9 +88,8 @@ private fun buildTerminalLaunch(command: String, tmpDir: Path, basePath: String?
         "TMPDIR" to tmpDir.toString(),
         "CODEX_JETBRAINS_TMPDIR" to tmpDir.toString(),
     )
-    val directCommand = parseDirectCommand(codexCommand)
     if (isWindows()) {
-        return TerminalLaunch(codexCommand, directCommand, workingDirectory, env)
+        return TerminalLaunch(codexCommand, codexCommand, workingDirectory, env)
     }
 
     val parts = mutableListOf<String>()
@@ -100,92 +100,16 @@ private fun buildTerminalLaunch(command: String, tmpDir: Path, basePath: String?
     }
     parts += CLEAR_TERMINAL_COMMAND
     parts += codexCommand
-    return TerminalLaunch(parts.joinToString("; "), directCommand, workingDirectory, env)
+    return TerminalLaunch(
+        command = listOf(CLEAR_TERMINAL_COMMAND, codexCommand).joinToString("; "),
+        fallbackCommand = parts.joinToString("; "),
+        workingDirectory = workingDirectory,
+        env = env,
+    )
 }
 
 private fun shellQuote(value: String): String {
     return "'" + value.replace("'", "'\"'\"'") + "'"
-}
-
-private fun parseDirectCommand(command: String): List<String>? {
-    if (command.isBlank()) {
-        return null
-    }
-
-    val windows = isWindows()
-    val tokens = mutableListOf<String>()
-    val current = StringBuilder()
-    var quote: Char? = null
-    var escaped = false
-    var tokenStarted = false
-    for (char in command) {
-        if (escaped) {
-            current.append(char)
-            escaped = false
-            tokenStarted = true
-            continue
-        }
-
-        when {
-            char == '\\' && !windows && quote != '\'' -> {
-                escaped = true
-                tokenStarted = true
-            }
-
-            quote != null -> {
-                if (char == quote) {
-                    quote = null
-                } else {
-                    current.append(char)
-                }
-                tokenStarted = true
-            }
-
-            char == '\'' || char == '"' -> {
-                quote = char
-                tokenStarted = true
-            }
-
-            char.isWhitespace() -> {
-                if (tokenStarted) {
-                    tokens += current.toString()
-                    current.clear()
-                    tokenStarted = false
-                }
-            }
-
-            char in DIRECT_COMMAND_UNSUPPORTED_CHARS -> return null
-
-            else -> {
-                current.append(char)
-                tokenStarted = true
-            }
-        }
-    }
-
-    if (escaped || quote != null) {
-        return null
-    }
-    if (tokenStarted) {
-        tokens += current.toString()
-    }
-
-    val executable = tokens.firstOrNull() ?: return null
-    if (!windows && isShellEnvironmentAssignment(executable)) {
-        return null
-    }
-    return tokens
-}
-
-private fun isShellEnvironmentAssignment(token: String): Boolean {
-    val separatorIndex = token.indexOf('=')
-    if (separatorIndex <= 0) {
-        return false
-    }
-
-    val name = token.take(separatorIndex)
-    return name.first().let { it == '_' || it.isLetter() } &&
-        name.all { it == '_' || it.isLetterOrDigit() }
 }
 
 private fun openIdeTerminal(
@@ -198,6 +122,7 @@ private fun openIdeTerminal(
         .invoke(null, project)
     findReusableCodexTerminal(project, manager)?.let { existingSession ->
         if (activateCodexTerminal(manager, existingSession)) {
+            project.service<CodexContextService>().sessionStarted(existingSession.lifecycleToken)
             return
         }
         forgetCodexTerminal(project, existingSession)
@@ -206,9 +131,7 @@ private fun openIdeTerminal(
     val reworkedSession = createReworkedTerminalSession(project, launch)
     if (reworkedSession != null) {
         rememberCodexTerminal(project, reworkedSession)
-        if (autoEnableIdeContext) {
-            monitorIdeMode(project, reworkedSession)
-        }
+        monitorCodexSession(project, reworkedSession, autoEnableIdeContext)
         return
     }
 
@@ -219,31 +142,43 @@ private fun openIdeTerminal(
     val session = CodexTerminalSession(
         widget = widget,
         content = findTerminalContent(manager, widget),
-        launchMode = TerminalLaunchMode.SHELL_COMMAND,
     )
     rememberCodexTerminal(project, session)
-    if (autoEnableIdeContext) {
-        monitorIdeMode(project, session)
-    }
+    monitorCodexSession(project, session, autoEnableIdeContext)
 }
 
 private data class CodexTerminalSession(
     val widget: Any,
     val content: Any?,
-    val launchMode: TerminalLaunchMode,
     val launchedAtNanos: Long = System.nanoTime(),
     val monitorControl: TerminalMonitorControl = TerminalMonitorControl(),
+    val processTracker: TerminalProcessTracker = TerminalProcessTracker(),
+    val lifecycleToken: Any = Any(),
 )
-
-private enum class TerminalLaunchMode {
-    DIRECT_PROCESS,
-    SHELL_COMMAND,
-}
 
 internal enum class TerminalProcessState {
     RUNNING,
     STOPPED,
     UNKNOWN,
+}
+
+internal class TerminalProcessTracker {
+    private val state = AtomicReference(TerminalProcessState.UNKNOWN)
+
+    fun current(): TerminalProcessState = state.get()
+
+    fun observe(observedState: TerminalProcessState): TerminalProcessState {
+        when (observedState) {
+            TerminalProcessState.RUNNING -> state.compareAndSet(TerminalProcessState.UNKNOWN, TerminalProcessState.RUNNING)
+            TerminalProcessState.STOPPED -> state.compareAndSet(TerminalProcessState.RUNNING, TerminalProcessState.STOPPED)
+            TerminalProcessState.UNKNOWN -> Unit
+        }
+        return state.get()
+    }
+
+    fun markStopped() {
+        state.set(TerminalProcessState.STOPPED)
+    }
 }
 
 internal class TerminalMonitorControl {
@@ -270,6 +205,11 @@ internal class TerminalMonitorControl {
         active.set(false)
         task.getAndSet(null)?.cancel(true)
     }
+
+    fun completed() {
+        active.set(false)
+        task.set(null)
+    }
 }
 
 private fun findReusableCodexTerminal(project: Project, manager: Any): CodexTerminalSession? {
@@ -295,13 +235,15 @@ private fun rememberCodexTerminal(project: Project, session: CodexTerminalSessio
     }
     if (previousSession != null && previousSession.monitorControl !== session.monitorControl) {
         previousSession.monitorControl.stop()
+        project.service<CodexContextService>().sessionStopped(previousSession.lifecycleToken)
     }
+    project.service<CodexContextService>().sessionStarted(session.lifecycleToken)
 }
 
 private fun forgetCodexTerminal(project: Project, session: CodexTerminalSession) {
     val removed = synchronized(activeCodexTerminals) {
         val projectKey = projectTerminalKey(project)
-        if (activeCodexTerminals[projectKey] === session) {
+        if (activeCodexTerminals[projectKey]?.lifecycleToken === session.lifecycleToken) {
             activeCodexTerminals.remove(projectKey)
             true
         } else {
@@ -310,6 +252,7 @@ private fun forgetCodexTerminal(project: Project, session: CodexTerminalSession)
     }
     if (removed) {
         session.monitorControl.stop()
+        project.service<CodexContextService>().sessionStopped(session.lifecycleToken)
     }
 }
 
@@ -323,11 +266,10 @@ private fun createReworkedTerminalSession(
     project: Project,
     launch: TerminalLaunch,
 ): CodexTerminalSession? {
-    val directCommand = launch.directCommand ?: return null
     val result = AtomicReference<CodexTerminalSession?>()
     runOnEdtAndWait {
         try {
-            result.set(createReworkedTerminalSessionOnEdt(project, launch, directCommand))
+            result.set(createReworkedTerminalSessionOnEdt(project, launch))
         } catch (ignored: Throwable) {
             result.set(null)
         }
@@ -338,7 +280,6 @@ private fun createReworkedTerminalSession(
 private fun createReworkedTerminalSessionOnEdt(
     project: Project,
     launch: TerminalLaunch,
-    directCommand: List<String>,
 ): CodexTerminalSession? {
     val tabsManagerClass = try {
         Class.forName(REWORKED_TERMINAL_TABS_MANAGER_CLASS)
@@ -355,33 +296,21 @@ private fun createReworkedTerminalSessionOnEdt(
     if (!invokeMethodIfPresent(builder, "workingDirectory", arrayOf(launch.workingDirectory))) {
         return null
     }
-    if (!invokeMethodIfPresent(builder, "shellCommand", arrayOf(directCommand))) {
-        return null
-    }
     invokeMethodIfPresent(builder, "envVariables", arrayOf(launch.env))
     invokeMethodIfPresent(builder, "tabName", arrayOf(CODEX_TERMINAL_TITLE))
     invokeMethodIfPresent(builder, "requestFocus", arrayOf(true))
-    reworkedTerminalProcessType("NON_SHELL")?.let { processType ->
-        invokeMethodIfPresent(builder, "processType", arrayOf(processType))
-    }
 
     val tab = invokeNoArgMethod(builder, "createTab") ?: return null
     val view = invokeNoArgMethod(tab, "getView") ?: return null
     val content = invokeNoArgMethod(tab, "getContent")
+    if (!sendTerminalViewCommand(view, launch.command)) {
+        invokeMethodIfPresent(tabsManager, "closeTab", arrayOf(tab))
+        return null
+    }
     return CodexTerminalSession(
         widget = view,
         content = content,
-        launchMode = TerminalLaunchMode.DIRECT_PROCESS,
     )
-}
-
-private fun reworkedTerminalProcessType(name: String): Any? {
-    val processTypeClass = try {
-        Class.forName(REWORKED_TERMINAL_PROCESS_TYPE_CLASS)
-    } catch (ignored: Throwable) {
-        return null
-    }
-    return processTypeClass.enumConstants?.firstOrNull { (it as? Enum<*>)?.name == name }
 }
 
 private fun refreshTerminalSession(
@@ -404,33 +333,39 @@ private fun isOpenTerminalSession(manager: Any, session: CodexTerminalSession): 
 }
 
 private fun isCodexProcessActive(session: CodexTerminalSession): Boolean {
-    val state = detectTerminalProcessState(
-        widget = session.widget,
-        directProcess = session.launchMode == TerminalLaunchMode.DIRECT_PROCESS,
-    )
+    if (session.processTracker.current() == TerminalProcessState.STOPPED) {
+        return false
+    }
+
+    val state = detectTerminalProcessState(session.widget)
+    if (session.processTracker.observe(state) == TerminalProcessState.STOPPED) {
+        session.monitorControl.stop()
+        return false
+    }
     if (state != TerminalProcessState.STOPPED) {
         return true
     }
 
     val elapsedNanos = System.nanoTime() - session.launchedAtNanos
-    return elapsedNanos >= 0L && elapsedNanos < CODEX_PROCESS_DETECTION_GRACE_NANOS
+    if (elapsedNanos >= 0L && elapsedNanos < CODEX_PROCESS_DETECTION_GRACE_NANOS) {
+        return true
+    }
+    session.processTracker.markStopped()
+    session.monitorControl.stop()
+    return false
 }
 
-internal fun detectTerminalProcessState(widget: Any, directProcess: Boolean): TerminalProcessState {
+internal fun detectTerminalProcessState(widget: Any): TerminalProcessState {
     val targets = terminalProcessStateTargets(widget)
-    if (directProcess) {
-        for (target in targets) {
-            terminalViewProcessState(target)?.let { return it }
-        }
-        return TerminalProcessState.UNKNOWN
-    }
-
     for (target in targets) {
         for (methodName in COMMAND_RUNNING_METHOD_NAMES) {
             invokeNoArgBooleanMethod(target, methodName)?.let { running ->
                 return if (running) TerminalProcessState.RUNNING else TerminalProcessState.STOPPED
             }
         }
+    }
+    for (target in targets) {
+        terminalShellCommandState(target)?.let { return it }
     }
     return TerminalProcessState.UNKNOWN
 }
@@ -444,24 +379,32 @@ private fun terminalProcessStateTargets(widget: Any): List<Any> {
     return targets
 }
 
-private fun terminalViewProcessState(target: Any): TerminalProcessState? {
-    val stateFlow = invokeNoArgMethodSafely(target, "getSessionState") ?: return null
-    val state = invokeNoArgMethodSafely(stateFlow, "getValue") ?: return null
+private fun terminalShellCommandState(target: Any): TerminalProcessState? {
+    val shellIntegrationDeferred = invokeNoArgMethodSafely(target, "getShellIntegrationDeferred") ?: return null
+    if (invokeNoArgBooleanMethod(shellIntegrationDeferred, "isCompleted") != true) {
+        return TerminalProcessState.UNKNOWN
+    }
+    val shellIntegration = invokeNoArgMethodSafely(shellIntegrationDeferred, "getCompleted")
+        ?: return TerminalProcessState.UNKNOWN
+    val statusFlow = invokeNoArgMethodSafely(shellIntegration, "getOutputStatus")
+        ?: return TerminalProcessState.UNKNOWN
+    val state = invokeNoArgMethodSafely(statusFlow, "getValue")
+        ?: return TerminalProcessState.UNKNOWN
     val stateName = ((state as? Enum<*>)?.name ?: state.toString())
         .filter { it.isLetter() }
         .lowercase()
     return when {
-        TERMINATED_SESSION_STATE_NAMES.any { stateName.endsWith(it) } -> TerminalProcessState.STOPPED
-        ACTIVE_SESSION_STATE_NAMES.any { stateName.endsWith(it) } -> TerminalProcessState.RUNNING
+        stateName.endsWith("executingcommand") -> TerminalProcessState.RUNNING
+        stateName.endsWith("typingcommand") -> TerminalProcessState.STOPPED
         else -> TerminalProcessState.UNKNOWN
     }
 }
 
 private fun invokeNoArgBooleanMethod(target: Any, name: String): Boolean? {
-    val method = target.javaClass.methods.firstOrNull {
-        it.name == name && it.parameterCount == 0 &&
-            (it.returnType == java.lang.Boolean.TYPE || it.returnType == java.lang.Boolean::class.java)
-    } ?: return null
+    val method = findInvocableInstanceMethod(target, name, emptyArray()) ?: return null
+    if (method.returnType != java.lang.Boolean.TYPE && method.returnType != java.lang.Boolean::class.java) {
+        return null
+    }
     return try {
         method.invoke(target) as? Boolean
     } catch (ignored: Throwable) {
@@ -584,9 +527,14 @@ private fun requestTerminalFocus(widget: Any) {
         ?.requestFocusInWindow()
 }
 
-private fun monitorIdeMode(project: Project, session: CodexTerminalSession) {
+private fun monitorCodexSession(
+    project: Project,
+    session: CodexTerminalSession,
+    autoEnableIdeContext: Boolean,
+) {
     val task = ApplicationManager.getApplication().executeOnPooledThread {
         val widget = session.widget
+        var shouldManageIdeMode = autoEnableIdeContext
         var codexSessionSeen = false
         var ideContextSeen = false
         var nextEnableAttemptMillis = 0L
@@ -594,12 +542,27 @@ private fun monitorIdeMode(project: Project, session: CodexTerminalSession) {
         var missingTextPolls = 0
         var keyActivityTracker: TerminalKeyActivityTracker? = null
         try {
-            keyActivityTracker = installTerminalKeyActivityTracker(widget)
+            if (autoEnableIdeContext) {
+                keyActivityTracker = installTerminalKeyActivityTracker(widget)
+            }
             while (!project.isDisposed && session.monitorControl.isActive()) {
+                if (!isCodexProcessActive(session)) {
+                    forgetCodexTerminal(project, session)
+                    return@executeOnPooledThread
+                }
+
+                if (!shouldManageIdeMode) {
+                    if (!waitForNextMonitorCheck(keyActivityTracker, CODEX_MONITOR_IDLE_POLL_MILLIS)) {
+                        return@executeOnPooledThread
+                    }
+                    continue
+                }
+
                 val nowMillis = System.currentTimeMillis()
                 if (!ideContextSeen && nowMillis >= initialEnableDeadlineMillis) {
-                    if (!waitForInitialEnableKeyActivity(project, keyActivityTracker, session.monitorControl)) {
-                        return@executeOnPooledThread
+                    if (!waitForInitialEnableKeyActivity(project, keyActivityTracker, session)) {
+                        shouldManageIdeMode = false
+                        continue
                     }
                     initialEnableDeadlineMillis = System.currentTimeMillis() + CODEX_READY_TIMEOUT_MILLIS
                     nextEnableAttemptMillis = 0L
@@ -610,7 +573,7 @@ private fun monitorIdeMode(project: Project, session: CodexTerminalSession) {
                 if (terminalText == null) {
                     missingTextPolls += 1
                     if (missingTextPolls >= CODEX_TERMINAL_MISSING_MAX_POLLS) {
-                        return@executeOnPooledThread
+                        shouldManageIdeMode = false
                     }
                     if (!waitForNextMonitorCheck(keyActivityTracker, CODEX_MONITOR_IDLE_POLL_MILLIS)) {
                         return@executeOnPooledThread
@@ -641,6 +604,7 @@ private fun monitorIdeMode(project: Project, session: CodexTerminalSession) {
             }
         } finally {
             keyActivityTracker?.close()
+            session.monitorControl.completed()
         }
     }
     session.monitorControl.attach(task)
@@ -649,10 +613,13 @@ private fun monitorIdeMode(project: Project, session: CodexTerminalSession) {
 private fun waitForInitialEnableKeyActivity(
     project: Project,
     keyActivityTracker: TerminalKeyActivityTracker?,
-    monitorControl: TerminalMonitorControl,
+    session: CodexTerminalSession,
 ): Boolean {
     val baselineKeyPressCount = keyActivityTracker?.keyPressCount() ?: return false
-    while (!project.isDisposed && monitorControl.isActive()) {
+    while (!project.isDisposed && session.monitorControl.isActive()) {
+        if (!isCodexProcessActive(session)) {
+            return false
+        }
         val nextKeyPressCount = keyActivityTracker.awaitNextKeyPress(
             baselineKeyPressCount,
             CODEX_INITIAL_ENABLE_KEY_WAIT_POLL_MILLIS,
@@ -1070,35 +1037,27 @@ private fun executeWithTtyConnector(target: Any, action: (Any) -> Unit): Boolean
 }
 
 private fun invokeConsumerMethodIfPresent(target: Any, name: String, consumer: Consumer<Any>): Boolean {
-    val method = target.javaClass.methods.firstOrNull {
-        it.name == name &&
-            it.parameterCount == 1 &&
-            it.parameterTypes[0].isAssignableFrom(Consumer::class.java)
-    } ?: return false
+    val method = findInvocableInstanceMethod(target, name, arrayOf(consumer)) ?: return false
     method.invoke(target, consumer)
     return true
 }
 
 private fun invokeNoArgMethod(target: Any, name: String): Any? {
-    val method = target.javaClass.methods.firstOrNull {
-        it.name == name && it.parameterCount == 0
-    } ?: return null
+    val method = findInvocableInstanceMethod(target, name, emptyArray()) ?: return null
     return method.invoke(target)
 }
 
 private fun writeToTtyConnector(connector: Any, payload: String) {
-    val stringMethod = connector.javaClass.methods.firstOrNull {
-        it.name == "write" && it.parameterCount == 1 && it.parameterTypes[0] == String::class.java
-    }
+    val stringMethod = findInvocableInstanceMethod(connector, "write", arrayOf(payload))
     if (stringMethod != null) {
         stringMethod.invoke(connector, payload)
         return
     }
 
-    val bytesMethod = connector.javaClass.methods.firstOrNull {
-        it.name == "write" && it.parameterCount == 1 && it.parameterTypes[0] == ByteArray::class.java
-    } ?: throw IllegalStateException("The terminal TTY connector does not expose a supported write method")
-    bytesMethod.invoke(connector, payload.toByteArray(StandardCharsets.UTF_8) as Any)
+    val bytes = payload.toByteArray(StandardCharsets.UTF_8)
+    val bytesMethod = findInvocableInstanceMethod(connector, "write", arrayOf(bytes as Any))
+        ?: throw IllegalStateException("The terminal TTY connector does not expose a supported write method")
+    bytesMethod.invoke(connector, bytes as Any)
 }
 
 private fun createTerminalWidget(manager: Any, workingDirectory: String): Any {
@@ -1133,9 +1092,7 @@ private fun invokeFirstStringMethod(target: Any, names: List<String>, argument: 
 }
 
 private fun invokeMethod(target: Any, name: String, args: Array<Any?>): Any? {
-    val method = target.javaClass.methods.firstOrNull {
-        it.name == name && it.parameterCount == args.size && parametersAccept(it, args)
-    } ?: return null
+    val method = findInvocableInstanceMethod(target, name, args) ?: return null
     return method.invoke(target, *args)
 }
 
@@ -1150,11 +1107,44 @@ private fun invokeStaticMethod(targetClass: Class<*>, name: String, args: Array<
 }
 
 private fun invokeMethodIfPresent(target: Any, name: String, args: Array<Any?>): Boolean {
-    val method = target.javaClass.methods.firstOrNull {
-        it.name == name && it.parameterCount == args.size && parametersAccept(it, args)
-    } ?: return false
+    val method = findInvocableInstanceMethod(target, name, args) ?: return false
     method.invoke(target, *args)
     return true
+}
+
+private fun findInvocableInstanceMethod(target: Any, name: String, args: Array<Any?>): Method? {
+    val visitedTypes = mutableSetOf<Class<*>>()
+    val pendingTypes = ArrayDeque<Class<*>>()
+    pendingTypes.add(target.javaClass)
+    while (pendingTypes.isNotEmpty()) {
+        val type = pendingTypes.removeFirst()
+        if (!visitedTypes.add(type)) {
+            continue
+        }
+        if (Modifier.isPublic(type.modifiers)) {
+            type.declaredMethods.firstOrNull { method ->
+                Modifier.isPublic(method.modifiers) &&
+                    !Modifier.isStatic(method.modifiers) &&
+                    method.name == name &&
+                    method.parameterCount == args.size &&
+                    parametersAccept(method, args)
+            }?.let { return it }
+        }
+        type.interfaces.forEach(pendingTypes::addLast)
+        type.superclass?.let(pendingTypes::addLast)
+    }
+
+    val implementationMethod = target.javaClass.methods.firstOrNull { method ->
+        !Modifier.isStatic(method.modifiers) &&
+            method.name == name &&
+            method.parameterCount == args.size &&
+            parametersAccept(method, args)
+    } ?: return null
+    return try {
+        implementationMethod.takeIf { it.trySetAccessible() }
+    } catch (ignored: Throwable) {
+        null
+    }
 }
 
 private fun parametersAccept(method: Method, args: Array<Any?>): Boolean {
@@ -1209,11 +1199,7 @@ private const val CODEX_PROMPT_SCAN_LINES = 8
 private const val CODEX_IDE_STATUS_SCAN_LINES = 8
 private const val REWORKED_TERMINAL_TABS_MANAGER_CLASS =
     "com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager"
-private const val REWORKED_TERMINAL_PROCESS_TYPE_CLASS = "org.jetbrains.plugins.terminal.startup.TerminalProcessType"
-private val DIRECT_COMMAND_UNSUPPORTED_CHARS = setOf(';', '|', '&', '<', '>', '(', ')', '{', '}', '*', '?', '~', '$', '`')
 private val COMMAND_RUNNING_METHOD_NAMES = listOf("isCommandRunning", "hasRunningCommands")
-private val ACTIVE_SESSION_STATE_NAMES = listOf("notstarted", "starting", "connecting", "connected", "running")
-private val TERMINATED_SESSION_STATE_NAMES = listOf("terminated", "stopped", "disconnected", "closed", "failed")
 private val CODEX_READY_PROMPT_REGEX = Regex("(?m)^\\s*(\\x{203a}\\s|Ask Codex\\b)")
 private val CODEX_STATUS_LINE_REGEX = Regex("\\s\\u00b7\\s|\\bIDE context\\b", RegexOption.IGNORE_CASE)
 private val CODEX_IDE_CONTEXT_INDICATOR_REGEX = Regex("\\bIDE context\\b", RegexOption.IGNORE_CASE)

@@ -17,15 +17,10 @@ import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.intellij.openapi.Disposable
-import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.application.ModalityState
-import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.components.Service
+import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.logger
-import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.vfs.VirtualFile
-import com.intellij.psi.PsiDocumentManager
 import com.sun.jna.Native
 import com.sun.jna.Pointer
 import com.sun.jna.WString
@@ -199,7 +194,7 @@ class CodexIpcService : Disposable {
             ?: return errorResponse(requestId, "no-client-found")
 
         val context = try {
-            snapshotOnEdt(project)
+            project.service<CodexContextService>().captureForSend()
         } catch (error: Throwable) {
             log.warn("Failed to collect Codex IDE context", error)
             return errorResponse(requestId, "context-unavailable")
@@ -258,133 +253,6 @@ class CodexIpcService : Disposable {
         return null
     }
 
-    private fun snapshotOnEdt(project: Project): IdeContext {
-        val app = ApplicationManager.getApplication()
-        if (app.isDispatchThread) {
-            return snapshot(project)
-        }
-
-        var result: IdeContext? = null
-        var failure: Throwable? = null
-        app.invokeAndWait(
-            {
-                try {
-                    result = snapshot(project)
-                } catch (error: Throwable) {
-                    failure = error
-                }
-            },
-            ModalityState.any(),
-        )
-        failure?.let { throw it }
-        return requireNotNull(result)
-    }
-
-    private fun snapshot(project: Project): IdeContext = ReadAction.compute<IdeContext, RuntimeException> {
-        val editor = FileEditorManager.getInstance(project).selectedTextEditor
-        val activeFile = editor?.let { currentEditor ->
-            val file = com.intellij.openapi.fileEditor.FileDocumentManager
-                .getInstance()
-                .getFile(currentEditor.document)
-            if (file == null) null else activeFile(project, currentEditor, file)
-        }
-
-        IdeContext(
-            activeFile = activeFile,
-            openTabs = FileEditorManager.getInstance(project)
-                .openFiles
-                .map { fileDescriptor(project, it) }
-                .distinctBy { it.path },
-        )
-    }
-
-    private fun activeFile(
-        project: Project,
-        editor: com.intellij.openapi.editor.Editor,
-        file: VirtualFile,
-    ): ActiveFile {
-        val document = editor.document
-        val primaryCaret = editor.caretModel.primaryCaret
-        val primaryRange = rangeForOffsets(document, primaryCaret.selectionStart, primaryCaret.selectionEnd)
-        val selectedCarets = editor.caretModel.allCarets.filter { it.hasSelection() }
-        val selections = selectedCarets.map {
-            rangeForOffsets(document, it.selectionStart, it.selectionEnd)
-        }
-        val content = if (selectedCarets.size <= 1 && primaryCaret.hasSelection()) {
-            selectedText(document.charsSequence, primaryCaret.selectionStart, primaryCaret.selectionEnd)
-        } else {
-            ""
-        }
-
-        val descriptor = fileDescriptor(project, file)
-        return ActiveFile(
-            label = descriptor.label,
-            path = descriptor.path,
-            fsPath = descriptor.fsPath,
-            language = language(project, document),
-            selection = primaryRange,
-            activeSelectionContent = content,
-            selections = selections,
-        )
-    }
-
-    private fun selectedText(chars: CharSequence, startOffset: Int, endOffset: Int): String {
-        val start = minOf(startOffset, endOffset).coerceIn(0, chars.length)
-        val end = maxOf(startOffset, endOffset).coerceIn(0, chars.length)
-        val selectedLength = end - start
-        if (selectedLength <= MAX_ACTIVE_SELECTION_CHARS) {
-            return chars.subSequence(start, end).toString()
-        }
-
-        return chars.subSequence(start, start + MAX_ACTIVE_SELECTION_CHARS).toString() +
-            "\n[Selection truncated by Codex CLI Bridge to $MAX_ACTIVE_SELECTION_CHARS characters.]"
-    }
-
-    private fun language(project: Project, document: com.intellij.openapi.editor.Document): String? {
-        return PsiDocumentManager.getInstance(project).getPsiFile(document)?.language?.displayName
-    }
-
-    private fun fileDescriptor(project: Project, file: VirtualFile): FileDescriptor {
-        val fsPath = file.path
-        return FileDescriptor(
-            label = file.name,
-            path = relativePath(project, fsPath),
-            fsPath = fsPath,
-        )
-    }
-
-    private fun relativePath(project: Project, fsPath: String): String {
-        val basePath = project.basePath ?: return fsPath
-        val base = Paths.get(basePath).toAbsolutePath().normalize()
-        val file = Paths.get(fsPath).toAbsolutePath().normalize()
-        return if (file.startsWith(base)) {
-            base.relativize(file).toString().replace('\\', '/')
-        } else {
-            fsPath
-        }
-    }
-
-    private fun rangeForOffsets(
-        document: com.intellij.openapi.editor.Document,
-        startOffset: Int,
-        endOffset: Int,
-    ): Range {
-        return Range(
-            start = positionForOffset(document, startOffset),
-            end = positionForOffset(document, endOffset),
-        )
-    }
-
-    private fun positionForOffset(document: com.intellij.openapi.editor.Document, rawOffset: Int): Position {
-        val offset = rawOffset.coerceIn(0, document.textLength)
-        if (document.lineCount == 0) {
-            return Position(0, 0)
-        }
-        val line = document.getLineNumber(offset)
-        val character = offset - document.getLineStartOffset(line)
-        return Position(line, character)
-    }
-
     private fun discoveryResponse(requestId: String?): String {
         return gson.toJson(
             mapOf(
@@ -413,7 +281,6 @@ class CodexIpcService : Disposable {
     }
 }
 
-private const val MAX_ACTIVE_SELECTION_CHARS = 40_000
 private const val MAX_FRAME_BYTES = 256 * 1024 * 1024
 private const val CLIENT_ID = "jetbrains-client"
 private const val WINDOWS_PIPE_BRIDGE_KEY = "windows-named-pipe"
@@ -608,38 +475,6 @@ private class WindowsPipeConnection(
         onClose()
     }
 }
-
-private data class IdeContext(
-    val activeFile: ActiveFile?,
-    val openTabs: List<FileDescriptor>,
-    val processEnv: Map<String, String> = emptyMap(),
-)
-
-private data class ActiveFile(
-    val label: String,
-    val path: String,
-    val fsPath: String,
-    val language: String?,
-    val selection: Range,
-    val activeSelectionContent: String,
-    val selections: List<Range>,
-)
-
-private data class FileDescriptor(
-    val label: String,
-    val path: String,
-    val fsPath: String,
-)
-
-private data class Range(
-    val start: Position,
-    val end: Position,
-)
-
-private data class Position(
-    val line: Int,
-    val character: Int,
-)
 
 private fun JsonObject.stringField(name: String): String? {
     return get(name)?.takeIf { !it.isJsonNull }?.asString
