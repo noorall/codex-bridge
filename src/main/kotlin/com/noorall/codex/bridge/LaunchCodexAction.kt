@@ -32,6 +32,8 @@ import java.lang.reflect.Modifier
 import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import java.util.Collections
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.function.Consumer
@@ -205,7 +207,7 @@ private fun openIdeTerminal(
     if (reworkedSession != null) {
         rememberCodexTerminal(project, reworkedSession)
         if (autoEnableIdeContext) {
-            monitorIdeMode(project, reworkedSession.widget)
+            monitorIdeMode(project, reworkedSession)
         }
         return
     }
@@ -214,21 +216,66 @@ private fun openIdeTerminal(
     if (!invokeFirstStringMethod(widget, listOf("sendCommandToExecute", "executeCommand"), launch.fallbackCommand)) {
         throw IllegalStateException("The JetBrains terminal API does not expose a command execution method")
     }
-    rememberCodexTerminal(project, CodexTerminalSession(widget, findTerminalContent(manager, widget)))
+    val session = CodexTerminalSession(
+        widget = widget,
+        content = findTerminalContent(manager, widget),
+        launchMode = TerminalLaunchMode.SHELL_COMMAND,
+    )
+    rememberCodexTerminal(project, session)
     if (autoEnableIdeContext) {
-        monitorIdeMode(project, widget)
+        monitorIdeMode(project, session)
     }
 }
 
 private data class CodexTerminalSession(
     val widget: Any,
     val content: Any?,
+    val launchMode: TerminalLaunchMode,
+    val launchedAtNanos: Long = System.nanoTime(),
+    val monitorControl: TerminalMonitorControl = TerminalMonitorControl(),
 )
+
+private enum class TerminalLaunchMode {
+    DIRECT_PROCESS,
+    SHELL_COMMAND,
+}
+
+internal enum class TerminalProcessState {
+    RUNNING,
+    STOPPED,
+    UNKNOWN,
+}
+
+internal class TerminalMonitorControl {
+    private val active = AtomicBoolean(true)
+    private val task = AtomicReference<Future<*>?>()
+
+    fun isActive(): Boolean = active.get()
+
+    fun attach(task: Future<*>) {
+        if (!active.get()) {
+            task.cancel(true)
+            return
+        }
+        if (!this.task.compareAndSet(null, task)) {
+            task.cancel(true)
+            return
+        }
+        if (!active.get() && this.task.compareAndSet(task, null)) {
+            task.cancel(true)
+        }
+    }
+
+    fun stop() {
+        active.set(false)
+        task.getAndSet(null)?.cancel(true)
+    }
+}
 
 private fun findReusableCodexTerminal(project: Project, manager: Any): CodexTerminalSession? {
     registeredCodexTerminal(project)?.let { session ->
         val refreshedSession = refreshTerminalSession(project, manager, session)
-        if (isOpenTerminalSession(manager, refreshedSession)) {
+        if (isOpenTerminalSession(manager, refreshedSession) && isCodexProcessActive(refreshedSession)) {
             return refreshedSession
         }
         forgetCodexTerminal(project, refreshedSession)
@@ -243,17 +290,26 @@ private fun registeredCodexTerminal(project: Project): CodexTerminalSession? {
 }
 
 private fun rememberCodexTerminal(project: Project, session: CodexTerminalSession) {
-    synchronized(activeCodexTerminals) {
-        activeCodexTerminals[projectTerminalKey(project)] = session
+    val previousSession = synchronized(activeCodexTerminals) {
+        activeCodexTerminals.put(projectTerminalKey(project), session)
+    }
+    if (previousSession != null && previousSession.monitorControl !== session.monitorControl) {
+        previousSession.monitorControl.stop()
     }
 }
 
 private fun forgetCodexTerminal(project: Project, session: CodexTerminalSession) {
-    synchronized(activeCodexTerminals) {
+    val removed = synchronized(activeCodexTerminals) {
         val projectKey = projectTerminalKey(project)
         if (activeCodexTerminals[projectKey] === session) {
             activeCodexTerminals.remove(projectKey)
+            true
+        } else {
+            false
         }
+    }
+    if (removed) {
+        session.monitorControl.stop()
     }
 }
 
@@ -312,7 +368,11 @@ private fun createReworkedTerminalSessionOnEdt(
     val tab = invokeNoArgMethod(builder, "createTab") ?: return null
     val view = invokeNoArgMethod(tab, "getView") ?: return null
     val content = invokeNoArgMethod(tab, "getContent")
-    return CodexTerminalSession(view, content)
+    return CodexTerminalSession(
+        widget = view,
+        content = content,
+        launchMode = TerminalLaunchMode.DIRECT_PROCESS,
+    )
 }
 
 private fun reworkedTerminalProcessType(name: String): Any? {
@@ -341,6 +401,80 @@ private fun refreshTerminalSession(
 private fun isOpenTerminalSession(manager: Any, session: CodexTerminalSession): Boolean {
     val content = session.content ?: findTerminalContent(manager, session.widget) ?: return false
     return isValidTerminalContent(manager, content)
+}
+
+private fun isCodexProcessActive(session: CodexTerminalSession): Boolean {
+    val state = detectTerminalProcessState(
+        widget = session.widget,
+        directProcess = session.launchMode == TerminalLaunchMode.DIRECT_PROCESS,
+    )
+    if (state != TerminalProcessState.STOPPED) {
+        return true
+    }
+
+    val elapsedNanos = System.nanoTime() - session.launchedAtNanos
+    return elapsedNanos >= 0L && elapsedNanos < CODEX_PROCESS_DETECTION_GRACE_NANOS
+}
+
+internal fun detectTerminalProcessState(widget: Any, directProcess: Boolean): TerminalProcessState {
+    val targets = terminalProcessStateTargets(widget)
+    if (directProcess) {
+        for (target in targets) {
+            terminalViewProcessState(target)?.let { return it }
+        }
+        return TerminalProcessState.UNKNOWN
+    }
+
+    for (target in targets) {
+        for (methodName in COMMAND_RUNNING_METHOD_NAMES) {
+            invokeNoArgBooleanMethod(target, methodName)?.let { running ->
+                return if (running) TerminalProcessState.RUNNING else TerminalProcessState.STOPPED
+            }
+        }
+    }
+    return TerminalProcessState.UNKNOWN
+}
+
+private fun terminalProcessStateTargets(widget: Any): List<Any> {
+    val targets = mutableListOf(widget)
+    val newWidget = invokeNoArgMethodSafely(widget, "asNewWidget")
+    if (newWidget != null && targets.none { it === newWidget }) {
+        targets += newWidget
+    }
+    return targets
+}
+
+private fun terminalViewProcessState(target: Any): TerminalProcessState? {
+    val stateFlow = invokeNoArgMethodSafely(target, "getSessionState") ?: return null
+    val state = invokeNoArgMethodSafely(stateFlow, "getValue") ?: return null
+    val stateName = ((state as? Enum<*>)?.name ?: state.toString())
+        .filter { it.isLetter() }
+        .lowercase()
+    return when {
+        TERMINATED_SESSION_STATE_NAMES.any { stateName.endsWith(it) } -> TerminalProcessState.STOPPED
+        ACTIVE_SESSION_STATE_NAMES.any { stateName.endsWith(it) } -> TerminalProcessState.RUNNING
+        else -> TerminalProcessState.UNKNOWN
+    }
+}
+
+private fun invokeNoArgBooleanMethod(target: Any, name: String): Boolean? {
+    val method = target.javaClass.methods.firstOrNull {
+        it.name == name && it.parameterCount == 0 &&
+            (it.returnType == java.lang.Boolean.TYPE || it.returnType == java.lang.Boolean::class.java)
+    } ?: return null
+    return try {
+        method.invoke(target) as? Boolean
+    } catch (ignored: Throwable) {
+        null
+    }
+}
+
+private fun invokeNoArgMethodSafely(target: Any, name: String): Any? {
+    return try {
+        invokeNoArgMethod(target, name)
+    } catch (ignored: Throwable) {
+        null
+    }
 }
 
 private fun isValidTerminalContent(manager: Any, content: Any): Boolean {
@@ -450,19 +584,21 @@ private fun requestTerminalFocus(widget: Any) {
         ?.requestFocusInWindow()
 }
 
-private fun monitorIdeMode(project: Project, widget: Any) {
-    ApplicationManager.getApplication().executeOnPooledThread {
+private fun monitorIdeMode(project: Project, session: CodexTerminalSession) {
+    val task = ApplicationManager.getApplication().executeOnPooledThread {
+        val widget = session.widget
         var codexSessionSeen = false
         var ideContextSeen = false
         var nextEnableAttemptMillis = 0L
         var initialEnableDeadlineMillis = System.currentTimeMillis() + CODEX_READY_TIMEOUT_MILLIS
         var missingTextPolls = 0
-        val keyActivityTracker = installTerminalKeyActivityTracker(widget)
+        var keyActivityTracker: TerminalKeyActivityTracker? = null
         try {
-            while (!project.isDisposed) {
+            keyActivityTracker = installTerminalKeyActivityTracker(widget)
+            while (!project.isDisposed && session.monitorControl.isActive()) {
                 val nowMillis = System.currentTimeMillis()
                 if (!ideContextSeen && nowMillis >= initialEnableDeadlineMillis) {
-                    if (!waitForInitialEnableKeyActivity(project, keyActivityTracker)) {
+                    if (!waitForInitialEnableKeyActivity(project, keyActivityTracker, session.monitorControl)) {
                         return@executeOnPooledThread
                     }
                     initialEnableDeadlineMillis = System.currentTimeMillis() + CODEX_READY_TIMEOUT_MILLIS
@@ -507,14 +643,16 @@ private fun monitorIdeMode(project: Project, widget: Any) {
             keyActivityTracker?.close()
         }
     }
+    session.monitorControl.attach(task)
 }
 
 private fun waitForInitialEnableKeyActivity(
     project: Project,
     keyActivityTracker: TerminalKeyActivityTracker?,
+    monitorControl: TerminalMonitorControl,
 ): Boolean {
     val baselineKeyPressCount = keyActivityTracker?.keyPressCount() ?: return false
-    while (!project.isDisposed) {
+    while (!project.isDisposed && monitorControl.isActive()) {
         val nextKeyPressCount = keyActivityTracker.awaitNextKeyPress(
             baselineKeyPressCount,
             CODEX_INITIAL_ENABLE_KEY_WAIT_POLL_MILLIS,
@@ -1064,6 +1202,7 @@ private const val CODEX_IDE_ENABLE_COOLDOWN_MILLIS = 10000L
 private const val CODEX_IDE_ENABLE_RETRY_MILLIS = 1000L
 private const val CODEX_IDE_ENABLE_ECHO_TIMEOUT_MILLIS = 5000L
 private const val CODEX_COMMAND_SUBMIT_DELAY_MILLIS = 250L
+private const val CODEX_PROCESS_DETECTION_GRACE_NANOS = 2_000_000_000L
 private const val CODEX_READY_TIMEOUT_MILLIS = 180000L
 private const val CODEX_INITIAL_ENABLE_KEY_WAIT_POLL_MILLIS = 1000L
 private const val CODEX_PROMPT_SCAN_LINES = 8
@@ -1072,6 +1211,9 @@ private const val REWORKED_TERMINAL_TABS_MANAGER_CLASS =
     "com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager"
 private const val REWORKED_TERMINAL_PROCESS_TYPE_CLASS = "org.jetbrains.plugins.terminal.startup.TerminalProcessType"
 private val DIRECT_COMMAND_UNSUPPORTED_CHARS = setOf(';', '|', '&', '<', '>', '(', ')', '{', '}', '*', '?', '~', '$', '`')
+private val COMMAND_RUNNING_METHOD_NAMES = listOf("isCommandRunning", "hasRunningCommands")
+private val ACTIVE_SESSION_STATE_NAMES = listOf("notstarted", "starting", "connecting", "connected", "running")
+private val TERMINATED_SESSION_STATE_NAMES = listOf("terminated", "stopped", "disconnected", "closed", "failed")
 private val CODEX_READY_PROMPT_REGEX = Regex("(?m)^\\s*(\\x{203a}\\s|Ask Codex\\b)")
 private val CODEX_STATUS_LINE_REGEX = Regex("\\s\\u00b7\\s|\\bIDE context\\b", RegexOption.IGNORE_CASE)
 private val CODEX_IDE_CONTEXT_INDICATOR_REGEX = Regex("\\bIDE context\\b", RegexOption.IGNORE_CASE)
