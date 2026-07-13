@@ -1,14 +1,16 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.1] - 2026-07-13
 
 ### Added
 
-- Show the live Codex IDE context in the project status bar with selection preview, active file, open tabs, and last-sent time.
+- Support the reworked JetBrains terminal and reuse active Codex tabs.
+- Show live Codex IDE context in the status bar.
 
 ### Fixed
 
-- Stop Codex session monitoring and hide the context widget when the terminal process exits.
+- Enable IDE context faster and restore it after Codex `/clear`.
+- Stop reusing Codex terminals after the process exits or is cancelled.
 
 ## [0.1.0] - 2026-07-08
 
