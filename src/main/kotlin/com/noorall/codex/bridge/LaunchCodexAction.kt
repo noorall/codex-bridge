@@ -33,6 +33,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import java.util.ArrayDeque
 import java.util.Collections
+import java.util.UUID
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -79,17 +80,26 @@ private data class TerminalLaunch(
     val fallbackCommand: String,
     val workingDirectory: String,
     val env: Map<String, String>,
+    val exitMarker: String?,
 )
 
 private fun buildTerminalLaunch(command: String, tmpDir: Path, basePath: String?): TerminalLaunch {
     val codexCommand = command.ifBlank { DEFAULT_CODEX_COMMAND }
     val workingDirectory = basePath ?: System.getProperty("user.home")
+    val windows = isWindows()
+    val shellPath = configuredTerminalShellPath()?.takeUnless { it.isBlank() } ?: System.getenv("SHELL")
+    val exitMarker = if (!windows && supportsShellExitTrap(shellPath)) {
+        CODEX_EXIT_MARKER_PREFIX + UUID.randomUUID().toString().replace("-", "")
+    } else {
+        null
+    }
+    val monitoredCommand = exitMarker?.let { appendCodexExitMarker(codexCommand, it) } ?: codexCommand
     val env = mapOf(
         "TMPDIR" to tmpDir.toString(),
         "CODEX_JETBRAINS_TMPDIR" to tmpDir.toString(),
     )
-    if (isWindows()) {
-        return TerminalLaunch(codexCommand, codexCommand, workingDirectory, env)
+    if (windows) {
+        return TerminalLaunch(monitoredCommand, monitoredCommand, workingDirectory, env, exitMarker)
     }
 
     val parts = mutableListOf<String>()
@@ -99,13 +109,39 @@ private fun buildTerminalLaunch(command: String, tmpDir: Path, basePath: String?
         parts += "cd ${shellQuote(basePath)}"
     }
     parts += CLEAR_TERMINAL_COMMAND
-    parts += codexCommand
+    parts += monitoredCommand
     return TerminalLaunch(
-        command = listOf(CLEAR_TERMINAL_COMMAND, codexCommand).joinToString("; "),
+        command = listOf(CLEAR_TERMINAL_COMMAND, monitoredCommand).joinToString("; "),
         fallbackCommand = parts.joinToString("; "),
         workingDirectory = workingDirectory,
         env = env,
+        exitMarker = exitMarker,
     )
+}
+
+internal fun appendCodexExitMarker(command: String, exitMarker: String): String {
+    val cleanup = "trap - EXIT HUP INT TERM; printf '\\n%s\\n' ${shellQuote(exitMarker)}"
+    return "( trap \"$cleanup\" EXIT HUP INT TERM; ( $command\n) )"
+}
+
+private fun configuredTerminalShellPath(): String? {
+    return try {
+        val optionsClass = Class.forName("org.jetbrains.plugins.terminal.TerminalOptionsProvider")
+        val options = optionsClass.getMethod("getInstance").invoke(null) ?: return null
+        invokeNoArgMethod(options, "getShellPath") as? String
+    } catch (ignored: Throwable) {
+        null
+    }
+}
+
+internal fun supportsShellExitTrap(shellPath: String?): Boolean {
+    val configuredPath = shellPath?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+    val executablePath = when (configuredPath.first()) {
+        '\'', '"' -> configuredPath.drop(1).substringBefore(configuredPath.first())
+        else -> configuredPath.substringBefore(' ')
+    }
+    val executable = executablePath.substringAfterLast('/').lowercase()
+    return executable in POSIX_TRAP_SHELL_NAMES
 }
 
 private fun shellQuote(value: String): String {
@@ -142,6 +178,7 @@ private fun openIdeTerminal(
     val session = CodexTerminalSession(
         widget = widget,
         content = findTerminalContent(manager, widget),
+        exitMarker = launch.exitMarker,
     )
     rememberCodexTerminal(project, session)
     monitorCodexSession(project, session, autoEnableIdeContext)
@@ -150,6 +187,7 @@ private fun openIdeTerminal(
 private data class CodexTerminalSession(
     val widget: Any,
     val content: Any?,
+    val exitMarker: String?,
     val launchedAtNanos: Long = System.nanoTime(),
     val monitorControl: TerminalMonitorControl = TerminalMonitorControl(),
     val processTracker: TerminalProcessTracker = TerminalProcessTracker(),
@@ -215,7 +253,11 @@ internal class TerminalMonitorControl {
 private fun findReusableCodexTerminal(project: Project, manager: Any): CodexTerminalSession? {
     registeredCodexTerminal(project)?.let { session ->
         val refreshedSession = refreshTerminalSession(project, manager, session)
-        if (isOpenTerminalSession(manager, refreshedSession) && isCodexProcessActive(refreshedSession)) {
+        if (
+            isOpenTerminalSession(manager, refreshedSession) &&
+            !isCodexExitMarkerVisible(refreshedSession) &&
+            isCodexProcessActive(refreshedSession)
+        ) {
             return refreshedSession
         }
         forgetCodexTerminal(project, refreshedSession)
@@ -310,6 +352,7 @@ private fun createReworkedTerminalSessionOnEdt(
     return CodexTerminalSession(
         widget = view,
         content = content,
+        exitMarker = launch.exitMarker,
     )
 }
 
@@ -358,14 +401,14 @@ private fun isCodexProcessActive(session: CodexTerminalSession): Boolean {
 internal fun detectTerminalProcessState(widget: Any): TerminalProcessState {
     val targets = terminalProcessStateTargets(widget)
     for (target in targets) {
+        terminalShellCommandState(target)?.takeIf { it != TerminalProcessState.UNKNOWN }?.let { return it }
+    }
+    for (target in targets) {
         for (methodName in COMMAND_RUNNING_METHOD_NAMES) {
             invokeNoArgBooleanMethod(target, methodName)?.let { running ->
                 return if (running) TerminalProcessState.RUNNING else TerminalProcessState.STOPPED
             }
         }
-    }
-    for (target in targets) {
-        terminalShellCommandState(target)?.let { return it }
     }
     return TerminalProcessState.UNKNOWN
 }
@@ -551,6 +594,15 @@ private fun monitorCodexSession(
                     return@executeOnPooledThread
                 }
 
+                val terminalText = readTerminalTail(widget, CODEX_MONITOR_TAIL_CHARS)
+                if (
+                    terminalText != null &&
+                    session.exitMarker?.let { hasCodexExitMarker(terminalText, it) } == true
+                ) {
+                    forgetCodexTerminal(project, session)
+                    return@executeOnPooledThread
+                }
+
                 if (!shouldManageIdeMode) {
                     if (!waitForNextMonitorCheck(keyActivityTracker, CODEX_MONITOR_IDLE_POLL_MILLIS)) {
                         return@executeOnPooledThread
@@ -561,6 +613,10 @@ private fun monitorCodexSession(
                 val nowMillis = System.currentTimeMillis()
                 if (!ideContextSeen && nowMillis >= initialEnableDeadlineMillis) {
                     if (!waitForInitialEnableKeyActivity(project, keyActivityTracker, session)) {
+                        if (!project.isDisposed && !isCodexProcessActive(session)) {
+                            forgetCodexTerminal(project, session)
+                            return@executeOnPooledThread
+                        }
                         shouldManageIdeMode = false
                         continue
                     }
@@ -569,7 +625,6 @@ private fun monitorCodexSession(
                     continue
                 }
 
-                val terminalText = readTerminalTail(widget, CODEX_MONITOR_TAIL_CHARS)
                 if (terminalText == null) {
                     missingTextPolls += 1
                     if (missingTextPolls >= CODEX_TERMINAL_MISSING_MAX_POLLS) {
@@ -610,6 +665,16 @@ private fun monitorCodexSession(
     session.monitorControl.attach(task)
 }
 
+internal fun hasCodexExitMarker(terminalText: String, exitMarker: String): Boolean {
+    return terminalText.lineSequence().any { it.trim() == exitMarker }
+}
+
+private fun isCodexExitMarkerVisible(session: CodexTerminalSession): Boolean {
+    val exitMarker = session.exitMarker ?: return false
+    val terminalText = readTerminalTail(session.widget, CODEX_MONITOR_TAIL_CHARS) ?: return false
+    return hasCodexExitMarker(terminalText, exitMarker)
+}
+
 private fun waitForInitialEnableKeyActivity(
     project: Project,
     keyActivityTracker: TerminalKeyActivityTracker?,
@@ -618,6 +683,10 @@ private fun waitForInitialEnableKeyActivity(
     val baselineKeyPressCount = keyActivityTracker?.keyPressCount() ?: return false
     while (!project.isDisposed && session.monitorControl.isActive()) {
         if (!isCodexProcessActive(session)) {
+            return false
+        }
+        if (isCodexExitMarkerVisible(session)) {
+            session.processTracker.markStopped()
             return false
         }
         val nextKeyPressCount = keyActivityTracker.awaitNextKeyPress(
@@ -1182,6 +1251,7 @@ private enum class CodexTerminalState {
 
 private const val CODEX_TERMINAL_TITLE = "Codex"
 private const val CODEX_IDE_ENABLE_COMMAND = "/ide on"
+private const val CODEX_EXIT_MARKER_PREFIX = "__CODEX_BRIDGE_EXIT_"
 private const val TERMINAL_ENTER_INPUT = "\r"
 private const val CODEX_READY_POLL_MILLIS = 250L
 private const val CODEX_MONITOR_IDLE_POLL_MILLIS = 1500L
@@ -1199,6 +1269,7 @@ private const val CODEX_PROMPT_SCAN_LINES = 8
 private const val CODEX_IDE_STATUS_SCAN_LINES = 8
 private const val REWORKED_TERMINAL_TABS_MANAGER_CLASS =
     "com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager"
+private val POSIX_TRAP_SHELL_NAMES = setOf("sh", "ash", "bash", "dash", "ksh", "mksh", "zsh")
 private val COMMAND_RUNNING_METHOD_NAMES = listOf("isCommandRunning", "hasRunningCommands")
 private val CODEX_READY_PROMPT_REGEX = Regex("(?m)^\\s*(\\x{203a}\\s|Ask Codex\\b)")
 private val CODEX_STATUS_LINE_REGEX = Regex("\\s\\u00b7\\s|\\bIDE context\\b", RegexOption.IGNORE_CASE)

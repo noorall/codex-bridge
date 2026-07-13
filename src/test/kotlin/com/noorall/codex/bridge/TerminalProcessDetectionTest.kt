@@ -62,6 +62,53 @@ class TerminalProcessDetectionTest {
     }
 
     @Test
+    fun `keeps an unavailable shell integration state unknown`() {
+        assertEquals(
+            TerminalProcessState.UNKNOWN,
+            detectTerminalProcessState(TerminalViewWithPendingShellIntegration()),
+        )
+    }
+
+    @Test
+    fun `prefers an available shell state over stale command flags`() {
+        assertEquals(
+            TerminalProcessState.STOPPED,
+            detectTerminalProcessState(TerminalViewWithRunningFlag("TypingCommand", running = true)),
+        )
+        assertEquals(
+            TerminalProcessState.RUNNING,
+            detectTerminalProcessState(TerminalViewWithRunningFlag("ExecutingCommand", running = false)),
+        )
+    }
+
+    @Test
+    fun `wraps a command with an exit and interrupt marker trap`() {
+        val command = appendCodexExitMarker("codex --model test", "__CODEX_BRIDGE_EXIT_test")
+
+        assertTrue(command.startsWith("( trap \"trap - EXIT HUP INT TERM; printf"))
+        assertTrue(command.contains("'__CODEX_BRIDGE_EXIT_test'\" EXIT HUP INT TERM"))
+        assertTrue(command.endsWith("; ( codex --model test\n) )"))
+    }
+
+    @Test
+    fun `uses the exit marker only for shells with compatible traps`() {
+        assertTrue(supportsShellExitTrap("/bin/zsh -l"))
+        assertTrue(supportsShellExitTrap("'/opt/custom shell/bash' --noprofile"))
+        assertFalse(supportsShellExitTrap("/usr/bin/fish"))
+        assertFalse(supportsShellExitTrap(null))
+    }
+
+    @Test
+    fun `detects only the current exit marker on its own line`() {
+        val exitMarker = "__CODEX_BRIDGE_EXIT_current"
+
+        assertTrue(hasCodexExitMarker("Codex output\n$exitMarker\nshell prompt", exitMarker))
+        assertTrue(hasCodexExitMarker("Codex output\r\n  $exitMarker  \r\n", exitMarker))
+        assertFalse(hasCodexExitMarker("echo '$exitMarker'", exitMarker))
+        assertFalse(hasCodexExitMarker("__CODEX_BRIDGE_EXIT_previous", exitMarker))
+    }
+
+    @Test
     fun `checks the new widget adapter when present`() {
         assertEquals(
             TerminalProcessState.STOPPED,
@@ -148,10 +195,26 @@ class TerminalProcessDetectionTest {
         fun getShellIntegrationDeferred(): CompletedDeferred = shellIntegrationDeferred
     }
 
+    private class TerminalViewWithPendingShellIntegration {
+        fun getShellIntegrationDeferred(): PendingDeferred = PendingDeferred()
+    }
+
+    private class TerminalViewWithRunningFlag(state: String, private val running: Boolean) {
+        private val shellIntegrationDeferred = CompletedDeferred(ShellIntegration(state))
+
+        fun getShellIntegrationDeferred(): CompletedDeferred = shellIntegrationDeferred
+
+        fun isCommandRunning(): Boolean = running
+    }
+
     private class CompletedDeferred(private val value: Any) {
         fun isCompleted(): Boolean = true
 
         fun getCompleted(): Any = value
+    }
+
+    private class PendingDeferred {
+        fun isCompleted(): Boolean = false
     }
 
     private class ShellIntegration(state: String) {
