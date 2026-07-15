@@ -25,7 +25,6 @@ import java.awt.Component
 import java.awt.Container
 import java.awt.KeyEventDispatcher
 import java.awt.KeyboardFocusManager
-import java.awt.Window
 import java.awt.event.KeyEvent
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -189,6 +188,7 @@ private data class CodexTerminalSession(
     val content: Any?,
     val exitMarker: String?,
     val launchedAtNanos: Long = System.nanoTime(),
+    val launchedAtMillis: Long = System.currentTimeMillis(),
     val monitorControl: TerminalMonitorControl = TerminalMonitorControl(),
     val processTracker: TerminalProcessTracker = TerminalProcessTracker(),
     val lifecycleToken: Any = Any(),
@@ -577,17 +577,20 @@ private fun monitorCodexSession(
 ) {
     val task = ApplicationManager.getApplication().executeOnPooledThread {
         val widget = session.widget
-        var shouldManageIdeMode = autoEnableIdeContext
+        var canManageIdeMode = autoEnableIdeContext
+        var initialIdeMonitoring = autoEnableIdeContext
         var codexSessionSeen = false
         var ideContextSeen = false
         var nextEnableAttemptMillis = 0L
-        var initialEnableDeadlineMillis = System.currentTimeMillis() + CODEX_READY_TIMEOUT_MILLIS
+        val initialEnableDeadlineMillis = System.currentTimeMillis() + CODEX_READY_TIMEOUT_MILLIS
         var missingTextPolls = 0
         var keyActivityTracker: TerminalKeyActivityTracker? = null
+        var lastObservedEnterCount = 0L
+        var enterInteraction: TerminalEnterInteraction? = null
+        val desktopHandoffTracker = DesktopHandoffTracker()
         try {
-            if (autoEnableIdeContext) {
-                keyActivityTracker = installTerminalKeyActivityTracker(widget)
-            }
+            keyActivityTracker = installTerminalKeyActivityTracker(widget)
+            lastObservedEnterCount = keyActivityTracker?.enterCount() ?: 0L
             while (!project.isDisposed && session.monitorControl.isActive()) {
                 if (!isCodexProcessActive(session)) {
                     forgetCodexTerminal(project, session)
@@ -603,57 +606,111 @@ private fun monitorCodexSession(
                     return@executeOnPooledThread
                 }
 
-                if (!shouldManageIdeMode) {
-                    if (!waitForNextMonitorCheck(keyActivityTracker, CODEX_MONITOR_IDLE_POLL_MILLIS)) {
-                        return@executeOnPooledThread
-                    }
-                    continue
-                }
-
                 val nowMillis = System.currentTimeMillis()
-                if (!ideContextSeen && nowMillis >= initialEnableDeadlineMillis) {
-                    if (!waitForInitialEnableKeyActivity(project, keyActivityTracker, session)) {
-                        if (!project.isDisposed && !isCodexProcessActive(session)) {
-                            forgetCodexTerminal(project, session)
-                            return@executeOnPooledThread
-                        }
-                        shouldManageIdeMode = false
-                        continue
-                    }
-                    initialEnableDeadlineMillis = System.currentTimeMillis() + CODEX_READY_TIMEOUT_MILLIS
-                    nextEnableAttemptMillis = 0L
-                    continue
+                if (initialIdeMonitoring && nowMillis >= initialEnableDeadlineMillis) {
+                    initialIdeMonitoring = false
                 }
 
                 if (terminalText == null) {
                     missingTextPolls += 1
                     if (missingTextPolls >= CODEX_TERMINAL_MISSING_MAX_POLLS) {
-                        shouldManageIdeMode = false
+                        canManageIdeMode = false
+                        initialIdeMonitoring = false
                     }
-                    if (!waitForNextMonitorCheck(keyActivityTracker, CODEX_MONITOR_IDLE_POLL_MILLIS)) {
+                    val waitResult = waitForNextMonitorCheck(
+                        keyActivityTracker,
+                        lastObservedEnterCount,
+                        CODEX_MONITOR_IDLE_FALLBACK_POLL_MILLIS,
+                    ) ?: return@executeOnPooledThread
+                    if (waitResult > lastObservedEnterCount) {
+                        lastObservedEnterCount = waitResult
+                        enterInteraction = TerminalEnterInteraction(System.currentTimeMillis())
+                        nextEnableAttemptMillis = 0L
+                    }
+                    if (!session.monitorControl.isActive()) {
                         return@executeOnPooledThread
                     }
                     continue
                 }
 
                 missingTextPolls = 0
+                val newDesktopHandoff = desktopHandoffTracker.observe(terminalText)
                 val ideContextOn = hasIdeContextIndicator(terminalText)
                 ideContextSeen = ideContextSeen || ideContextOn
-                if (codexTerminalState(terminalText, codexSessionSeen) == CodexTerminalState.READY) {
+                if (ideContextOn) {
+                    initialIdeMonitoring = false
+                }
+                val terminalReady = codexTerminalState(terminalText, codexSessionSeen) == CodexTerminalState.READY
+                if (terminalReady) {
                     codexSessionSeen = true
-                    if (shouldEnableIdeMode(ideContextOn, ideContextSeen, keyActivityTracker, nowMillis, nextEnableAttemptMillis)) {
-                        val submitted = tryEnableIdeMode(widget)
-                        val retryDelayMillis = if (ideContextSeen && submitted) {
-                            CODEX_IDE_ENABLE_COOLDOWN_MILLIS
-                        } else {
-                            CODEX_IDE_ENABLE_RETRY_MILLIS
+                }
+                enterInteraction?.observe(nowMillis, terminalReady, ideContextOn, canManageIdeMode)
+
+                val interactionWantsIdeEnable = enterInteraction?.shouldEnableIdeMode(
+                    terminalReady,
+                    ideContextOn,
+                    canManageIdeMode,
+                ) == true
+                val enableIdeMode = canManageIdeMode &&
+                    terminalReady &&
+                    (initialIdeMonitoring || interactionWantsIdeEnable || keyActivityTracker == null) &&
+                    shouldEnableIdeMode(
+                        ideContextOn,
+                        ideContextSeen,
+                        keyActivityTracker,
+                        nowMillis,
+                        nextEnableAttemptMillis,
+                    )
+                val monitorActions = terminalMonitorActions(
+                    newDesktopHandoff = newDesktopHandoff,
+                    desktopRefreshEnabled = service<CodexSettingsService>().autoRefreshDesktopAfterAppHandoff,
+                    enableIdeMode = enableIdeMode,
+                )
+                for (action in monitorActions) {
+                    when (action) {
+                        TerminalMonitorAction.REFRESH_DESKTOP -> refreshDesktopSessionSilently(project, session)
+
+                        TerminalMonitorAction.ENABLE_IDE -> {
+                            val tracker = keyActivityTracker
+                            val submitted = if (tracker == null) {
+                                tryEnableIdeMode(widget)
+                            } else {
+                                tracker.withEnterSuppressed {
+                                    tryEnableIdeMode(widget)
+                                }
+                            }
+                            val retryDelayMillis = if (ideContextSeen && submitted) {
+                                CODEX_IDE_ENABLE_COOLDOWN_MILLIS
+                            } else {
+                                CODEX_IDE_ENABLE_RETRY_MILLIS
+                            }
+                            nextEnableAttemptMillis = System.currentTimeMillis() + retryDelayMillis
                         }
-                        nextEnableAttemptMillis = System.currentTimeMillis() + retryDelayMillis
                     }
                 }
 
-                val pollMillis = monitorPollMillis(ideContextSeen, initialEnableDeadlineMillis)
-                if (!waitForNextMonitorCheck(keyActivityTracker, pollMillis)) {
+                if (enterInteraction?.isComplete(nowMillis, terminalReady, ideContextOn, canManageIdeMode) == true) {
+                    enterInteraction = null
+                }
+
+                val pollMillis = monitorPollMillis(
+                    initialIdeMonitoring = initialIdeMonitoring,
+                    initialEnableDeadlineMillis = initialEnableDeadlineMillis,
+                    enterInteraction = enterInteraction,
+                    hasKeyActivityTracker = keyActivityTracker != null,
+                    nowMillis = nowMillis,
+                )
+                val waitResult = waitForNextMonitorCheck(
+                    keyActivityTracker,
+                    lastObservedEnterCount,
+                    pollMillis,
+                ) ?: return@executeOnPooledThread
+                if (waitResult > lastObservedEnterCount) {
+                    lastObservedEnterCount = waitResult
+                    enterInteraction = TerminalEnterInteraction(System.currentTimeMillis())
+                    nextEnableAttemptMillis = 0L
+                }
+                if (!session.monitorControl.isActive()) {
                     return@executeOnPooledThread
                 }
             }
@@ -663,6 +720,21 @@ private fun monitorCodexSession(
         }
     }
     session.monitorControl.attach(task)
+}
+
+private fun refreshDesktopSessionSilently(project: Project, session: CodexTerminalSession) {
+    val projectRoot = project.basePath?.let(Path::of) ?: return
+    try {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                CodexDesktopHandoff.refreshCurrentSession(projectRoot, session.launchedAtMillis)
+            } catch (_: Throwable) {
+                // Desktop refresh is best-effort and must never affect the Codex terminal monitor.
+            }
+        }
+    } catch (_: Throwable) {
+        // The application may already be shutting down.
+    }
 }
 
 internal fun hasCodexExitMarker(terminalText: String, exitMarker: String): Boolean {
@@ -675,42 +747,96 @@ private fun isCodexExitMarkerVisible(session: CodexTerminalSession): Boolean {
     return hasCodexExitMarker(terminalText, exitMarker)
 }
 
-private fun waitForInitialEnableKeyActivity(
-    project: Project,
-    keyActivityTracker: TerminalKeyActivityTracker?,
-    session: CodexTerminalSession,
-): Boolean {
-    val baselineKeyPressCount = keyActivityTracker?.keyPressCount() ?: return false
-    while (!project.isDisposed && session.monitorControl.isActive()) {
-        if (!isCodexProcessActive(session)) {
-            return false
-        }
-        if (isCodexExitMarkerVisible(session)) {
-            session.processTracker.markStopped()
-            return false
-        }
-        val nextKeyPressCount = keyActivityTracker.awaitNextKeyPress(
-            baselineKeyPressCount,
-            CODEX_INITIAL_ENABLE_KEY_WAIT_POLL_MILLIS,
+private fun monitorPollMillis(
+    initialIdeMonitoring: Boolean,
+    initialEnableDeadlineMillis: Long,
+    enterInteraction: TerminalEnterInteraction?,
+    hasKeyActivityTracker: Boolean,
+    nowMillis: Long,
+): Long {
+    if (initialIdeMonitoring) {
+        return minOf(
+            CODEX_READY_POLL_MILLIS,
+            (initialEnableDeadlineMillis - nowMillis).coerceAtLeast(1L),
         )
-        if (nextKeyPressCount != null) {
-            return true
-        }
     }
-    return false
+    enterInteraction?.let { return it.pollMillis(nowMillis) }
+    return if (hasKeyActivityTracker) {
+        CODEX_MONITOR_IDLE_HEALTH_POLL_MILLIS
+    } else {
+        CODEX_MONITOR_IDLE_FALLBACK_POLL_MILLIS
+    }
 }
 
-private fun monitorPollMillis(
-    ideContextSeen: Boolean,
-    initialEnableDeadlineMillis: Long,
-): Long {
-    if (ideContextSeen) {
-        return CODEX_MONITOR_IDLE_POLL_MILLIS
+internal enum class TerminalMonitorAction {
+    REFRESH_DESKTOP,
+    ENABLE_IDE,
+}
+
+internal fun terminalMonitorActions(
+    newDesktopHandoff: Boolean,
+    desktopRefreshEnabled: Boolean,
+    enableIdeMode: Boolean,
+): List<TerminalMonitorAction> = buildList {
+    if (newDesktopHandoff && desktopRefreshEnabled) {
+        add(TerminalMonitorAction.REFRESH_DESKTOP)
     }
-    return minOf(
-        CODEX_READY_POLL_MILLIS,
-        (initialEnableDeadlineMillis - System.currentTimeMillis()).coerceAtLeast(1L),
-    )
+    if (enableIdeMode) {
+        add(TerminalMonitorAction.ENABLE_IDE)
+    }
+}
+
+internal class TerminalEnterInteraction(
+    enteredAtMillis: Long,
+    private val fastPollDurationMillis: Long = CODEX_ENTER_FAST_POLL_DURATION_MILLIS,
+    private val readyTimeoutMillis: Long = CODEX_READY_TIMEOUT_MILLIS,
+) {
+    private val fastPollDeadlineMillis = enteredAtMillis + fastPollDurationMillis
+    private var readyDeadlineMillis: Long? = null
+
+    fun observe(nowMillis: Long, terminalReady: Boolean, ideContextOn: Boolean, manageIdeMode: Boolean) {
+        if (!terminalReady || (manageIdeMode && !ideContextOn)) {
+            if (readyDeadlineMillis == null) {
+                readyDeadlineMillis = nowMillis + readyTimeoutMillis
+            }
+        }
+    }
+
+    fun shouldEnableIdeMode(
+        terminalReady: Boolean,
+        ideContextOn: Boolean,
+        manageIdeMode: Boolean,
+    ): Boolean {
+        return readyDeadlineMillis != null && terminalReady && manageIdeMode && !ideContextOn
+    }
+
+    fun isComplete(
+        nowMillis: Long,
+        terminalReady: Boolean,
+        ideContextOn: Boolean,
+        manageIdeMode: Boolean,
+    ): Boolean {
+        if (nowMillis < fastPollDeadlineMillis) {
+            return false
+        }
+        val readyDeadline = readyDeadlineMillis ?: return true
+        return nowMillis >= readyDeadline || (terminalReady && (!manageIdeMode || ideContextOn))
+    }
+
+    fun pollMillis(nowMillis: Long): Long {
+        if (nowMillis < fastPollDeadlineMillis) {
+            return minOf(CODEX_READY_POLL_MILLIS, fastPollDeadlineMillis - nowMillis)
+        }
+        val readyDeadline = readyDeadlineMillis
+        return if (readyDeadline == null) {
+            1L
+        } else {
+            minOf(
+                CODEX_MONITOR_IDLE_FALLBACK_POLL_MILLIS,
+                (readyDeadline - nowMillis).coerceAtLeast(1L),
+            )
+        }
+    }
 }
 
 private fun shouldEnableIdeMode(
@@ -735,8 +861,14 @@ private fun shouldEnableIdeMode(
 private fun installTerminalKeyActivityTracker(
     widget: Any,
 ): TerminalKeyActivityTracker? {
-    val window = terminalWindow(widget) ?: return null
-    val tracker = TerminalKeyActivityTracker(window)
+    val terminalComponents = AtomicReference<List<Component>>(emptyList())
+    runOnEdtAndWait {
+        terminalComponents.set(terminalKeyTargetCandidates(widget).filterIsInstance<Component>().distinct())
+    }
+    if (terminalComponents.get().isEmpty()) {
+        return null
+    }
+    val tracker = TerminalKeyActivityTracker(terminalComponents.get())
     runOnEdtAndWait {
         tracker.install()
     }
@@ -744,18 +876,21 @@ private fun installTerminalKeyActivityTracker(
 }
 
 private class TerminalKeyActivityTracker(
-    private val window: Window,
+    private val terminalComponents: List<Component>,
 ) : AutoCloseable {
     private val monitor = Object()
     private val lastKeyPressMillis = AtomicLong(0L)
-    private val keyPressCount = AtomicLong(0L)
+    private val enterCount = AtomicLong(0L)
+    private val suppressedEnterDepth = AtomicLong(0L)
     private var installed = false
     private val dispatcher = KeyEventDispatcher { event ->
-        if (event.id == KeyEvent.KEY_PRESSED && eventWindow(event.component) == window) {
+        if (isTerminalKeyPress(event, terminalComponents)) {
             lastKeyPressMillis.set(System.currentTimeMillis())
-            keyPressCount.incrementAndGet()
-            synchronized(monitor) {
-                monitor.notifyAll()
+            if (isTerminalEnterKeyPress(event, terminalComponents) && suppressedEnterDepth.get() == 0L) {
+                enterCount.incrementAndGet()
+                synchronized(monitor) {
+                    monitor.notifyAll()
+                }
             }
         }
         false
@@ -772,34 +907,32 @@ private class TerminalKeyActivityTracker(
         return nowMillis - lastKeyPressMillis.get() >= quietMillis
     }
 
-    fun keyPressCount(): Long {
-        return keyPressCount.get()
+    fun enterCount(): Long {
+        return enterCount.get()
     }
 
-    fun awaitNextKeyPress(lastObservedCount: Long, delayMillis: Long): Long? {
-        if (keyPressCount.get() > lastObservedCount) {
-            return keyPressCount.get()
+    fun awaitNextEnter(lastObservedCount: Long, delayMillis: Long): Long? {
+        if (enterCount.get() > lastObservedCount) {
+            return enterCount.get()
         }
         return try {
             synchronized(monitor) {
-                if (keyPressCount.get() <= lastObservedCount) {
+                if (enterCount.get() <= lastObservedCount) {
                     monitor.wait(delayMillis)
                 }
             }
-            keyPressCount.get().takeIf { it > lastObservedCount }
+            enterCount.get().takeIf { it > lastObservedCount }
         } catch (ignored: InterruptedException) {
             null
         }
     }
 
-    fun awaitOrSleep(delayMillis: Long): Boolean {
+    fun <T> withEnterSuppressed(action: () -> T): T {
+        suppressedEnterDepth.incrementAndGet()
         return try {
-            synchronized(monitor) {
-                monitor.wait(delayMillis)
-            }
-            true
-        } catch (ignored: InterruptedException) {
-            false
+            action()
+        } finally {
+            suppressedEnterDepth.decrementAndGet()
         }
     }
 
@@ -811,31 +944,34 @@ private class TerminalKeyActivityTracker(
     }
 }
 
+internal fun isTerminalKeyPress(event: KeyEvent, terminalComponents: List<Component>): Boolean {
+    if (event.id != KeyEvent.KEY_PRESSED) {
+        return false
+    }
+    val source = event.component ?: return false
+    return terminalComponents.any { terminalComponent ->
+        source === terminalComponent ||
+            (terminalComponent is Container && SwingUtilities.isDescendingFrom(source, terminalComponent))
+    }
+}
+
+internal fun isTerminalEnterKeyPress(event: KeyEvent, terminalComponents: List<Component>): Boolean {
+    return event.keyCode == KeyEvent.VK_ENTER && isTerminalKeyPress(event, terminalComponents)
+}
+
 private fun waitForNextMonitorCheck(
     keyActivityTracker: TerminalKeyActivityTracker?,
+    lastObservedEnterCount: Long,
     delayMillis: Long,
-): Boolean {
-    return if (keyActivityTracker != null) {
-        keyActivityTracker.awaitOrSleep(delayMillis)
+): Long? {
+    if (keyActivityTracker != null) {
+        val nextEnter = keyActivityTracker.awaitNextEnter(lastObservedEnterCount, delayMillis)
+        return nextEnter ?: lastObservedEnterCount.takeIf { !Thread.currentThread().isInterrupted }
+    }
+    return if (sleepQuietly(delayMillis)) {
+        lastObservedEnterCount
     } else {
-        sleepQuietly(delayMillis)
-    }
-}
-
-private fun terminalWindow(widget: Any): Window? {
-    val window = AtomicReference<Window?>()
-    runOnEdtAndWait {
-        val component = terminalKeyTargetCandidates(widget).firstNotNullOfOrNull { it as? Component }
-        window.set(eventWindow(component))
-    }
-    return window.get()
-}
-
-private fun eventWindow(component: Component?): Window? {
-    return when (component) {
-        null -> null
-        is Window -> component
-        else -> SwingUtilities.getWindowAncestor(component)
+        null
     }
 }
 
@@ -1254,7 +1390,9 @@ private const val CODEX_IDE_ENABLE_COMMAND = "/ide on"
 private const val CODEX_EXIT_MARKER_PREFIX = "__CODEX_BRIDGE_EXIT_"
 private const val TERMINAL_ENTER_INPUT = "\r"
 private const val CODEX_READY_POLL_MILLIS = 250L
-private const val CODEX_MONITOR_IDLE_POLL_MILLIS = 1500L
+private const val CODEX_ENTER_FAST_POLL_DURATION_MILLIS = 5000L
+private const val CODEX_MONITOR_IDLE_FALLBACK_POLL_MILLIS = 1500L
+private const val CODEX_MONITOR_IDLE_HEALTH_POLL_MILLIS = 30000L
 private const val CODEX_MONITOR_TAIL_CHARS = 16000
 private const val CODEX_TERMINAL_MISSING_MAX_POLLS = 80
 private const val CODEX_TERMINAL_INPUT_QUIET_MILLIS = 1000L
@@ -1264,7 +1402,6 @@ private const val CODEX_IDE_ENABLE_ECHO_TIMEOUT_MILLIS = 5000L
 private const val CODEX_COMMAND_SUBMIT_DELAY_MILLIS = 250L
 private const val CODEX_PROCESS_DETECTION_GRACE_NANOS = 2_000_000_000L
 private const val CODEX_READY_TIMEOUT_MILLIS = 180000L
-private const val CODEX_INITIAL_ENABLE_KEY_WAIT_POLL_MILLIS = 1000L
 private const val CODEX_PROMPT_SCAN_LINES = 8
 private const val CODEX_IDE_STATUS_SCAN_LINES = 8
 private const val REWORKED_TERMINAL_TABS_MANAGER_CLASS =

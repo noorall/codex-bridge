@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Refresh Codex Desktop sessions through local IPC after successful `/app` handoffs, with a default-enabled setting.
+- Trigger terminal checks from Enter in the active Codex terminal, with a five-second fast scan and bounded ready-state recovery.
+
 ## [0.1.1] - 2026-07-13
 
 ### Added

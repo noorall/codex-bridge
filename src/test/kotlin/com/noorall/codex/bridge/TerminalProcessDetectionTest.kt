@@ -18,7 +18,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.awt.event.KeyEvent
 import java.util.concurrent.FutureTask
+import javax.swing.JPanel
+import javax.swing.JTextField
 
 class TerminalProcessDetectionTest {
     @Test
@@ -175,6 +178,146 @@ class TerminalProcessDetectionTest {
 
         assertFalse(monitorControl.isActive())
         assertTrue(task.isCancelled)
+    }
+
+    @Test
+    fun `detects only an exact desktop handoff line`() {
+        assertTrue(isDesktopHandoffLine("Opened this session in Codex Desktop."))
+        assertTrue(isDesktopHandoffLine("  • Opened this session in Codex Desktop.  "))
+        assertFalse(isDesktopHandoffLine("› Opened this session in Codex Desktop."))
+        assertFalse(isDesktopHandoffLine("prefix Opened this session in Codex Desktop."))
+        assertFalse(isDesktopHandoffLine("Opened this session in Codex Desktop"))
+    }
+
+    @Test
+    fun `consumes each rendered desktop handoff only once`() {
+        val tracker = DesktopHandoffTracker()
+        val firstScreen = """
+            - Did not push anything.
+
+            ─ Worked for 6m 57s ─
+
+            • Opened this session in Codex Desktop.
+
+            › Write tests for @filename
+        """.trimIndent()
+
+        assertTrue(tracker.observe(firstScreen))
+        assertFalse(tracker.observe(firstScreen))
+        assertFalse(tracker.observe("$firstScreen\n› a new user message"))
+        assertTrue(tracker.observe("$firstScreen\n• Opened this session in Codex Desktop."))
+        assertFalse(tracker.observe("$firstScreen\n• Opened this session in Codex Desktop."))
+    }
+
+    @Test
+    fun `allows a later handoff after old terminal output scrolls away`() {
+        val tracker = DesktopHandoffTracker()
+
+        assertTrue(tracker.observe("• Opened this session in Codex Desktop."))
+        assertFalse(tracker.observe("Only newer terminal output remains"))
+        assertTrue(tracker.observe("• Opened this session in Codex Desktop."))
+    }
+
+    @Test
+    fun `orders desktop refresh before ide recovery without making them exclusive`() {
+        assertEquals(
+            listOf(TerminalMonitorAction.REFRESH_DESKTOP, TerminalMonitorAction.ENABLE_IDE),
+            terminalMonitorActions(
+                newDesktopHandoff = true,
+                desktopRefreshEnabled = true,
+                enableIdeMode = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `rapidly polls for five seconds after enter`() {
+        val interaction = TerminalEnterInteraction(
+            enteredAtMillis = 1_000L,
+            fastPollDurationMillis = 5_000L,
+            readyTimeoutMillis = 180_000L,
+        )
+
+        interaction.observe(1_000L, terminalReady = true, ideContextOn = true, manageIdeMode = true)
+
+        assertEquals(250L, interaction.pollMillis(1_000L))
+        assertFalse(interaction.isComplete(5_999L, terminalReady = true, ideContextOn = true, manageIdeMode = true))
+        assertTrue(interaction.isComplete(6_000L, terminalReady = true, ideContextOn = true, manageIdeMode = true))
+    }
+
+    @Test
+    fun `waits up to 180 seconds when terminal leaves ready state`() {
+        val interaction = TerminalEnterInteraction(
+            enteredAtMillis = 1_000L,
+            fastPollDurationMillis = 5_000L,
+            readyTimeoutMillis = 180_000L,
+        )
+
+        interaction.observe(2_000L, terminalReady = false, ideContextOn = false, manageIdeMode = true)
+
+        assertFalse(interaction.isComplete(6_000L, terminalReady = false, ideContextOn = false, manageIdeMode = true))
+        assertEquals(1_500L, interaction.pollMillis(6_000L))
+        assertFalse(interaction.isComplete(181_999L, terminalReady = false, ideContextOn = false, manageIdeMode = true))
+        assertTrue(interaction.isComplete(182_000L, terminalReady = false, ideContextOn = false, manageIdeMode = true))
+    }
+
+    @Test
+    fun `requests ide recovery after ready returns without ide indicator`() {
+        val interaction = TerminalEnterInteraction(
+            enteredAtMillis = 1_000L,
+            fastPollDurationMillis = 5_000L,
+            readyTimeoutMillis = 180_000L,
+        )
+        interaction.observe(2_000L, terminalReady = false, ideContextOn = false, manageIdeMode = true)
+        interaction.observe(4_000L, terminalReady = true, ideContextOn = false, manageIdeMode = true)
+
+        assertTrue(
+            interaction.shouldEnableIdeMode(
+                terminalReady = true,
+                ideContextOn = false,
+                manageIdeMode = true,
+            ),
+        )
+        assertFalse(interaction.isComplete(6_000L, terminalReady = true, ideContextOn = false, manageIdeMode = true))
+        assertTrue(interaction.isComplete(6_000L, terminalReady = true, ideContextOn = true, manageIdeMode = true))
+    }
+
+    @Test
+    fun `accepts enter only from current terminal component tree`() {
+        val terminal = JPanel()
+        val terminalInput = JTextField()
+        val editor = JPanel()
+        val editorInput = JTextField()
+        terminal.add(terminalInput)
+        editor.add(editorInput)
+
+        assertTrue(isTerminalEnterKeyPress(keyPress(terminalInput, KeyEvent.VK_ENTER), listOf(terminal)))
+        assertFalse(isTerminalEnterKeyPress(keyPress(terminalInput, KeyEvent.VK_A), listOf(terminal)))
+        assertFalse(isTerminalEnterKeyPress(keyPress(editorInput, KeyEvent.VK_ENTER), listOf(terminal)))
+        assertFalse(
+            isTerminalEnterKeyPress(
+                KeyEvent(
+                    terminalInput,
+                    KeyEvent.KEY_RELEASED,
+                    0L,
+                    0,
+                    KeyEvent.VK_ENTER,
+                    KeyEvent.CHAR_UNDEFINED,
+                ),
+                listOf(terminal),
+            ),
+        )
+    }
+
+    private fun keyPress(source: JTextField, keyCode: Int): KeyEvent {
+        return KeyEvent(
+            source,
+            KeyEvent.KEY_PRESSED,
+            0L,
+            0,
+            keyCode,
+            KeyEvent.CHAR_UNDEFINED,
+        )
     }
 
     private class ModernTerminalWidget(private val running: Boolean) {

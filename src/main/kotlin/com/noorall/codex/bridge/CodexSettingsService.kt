@@ -40,11 +40,18 @@ class CodexSettingsService : PersistentStateComponent<CodexSettingsState> {
         set(value) {
             state.autoEnableIdeContext = value
         }
+
+    var autoRefreshDesktopAfterAppHandoff: Boolean
+        get() = state.autoRefreshDesktopAfterAppHandoff
+        set(value) {
+            state.autoRefreshDesktopAfterAppHandoff = value
+        }
 }
 
 data class CodexSettingsState(
     var codexCommand: String = DEFAULT_CODEX_COMMAND,
     var autoEnableIdeContext: Boolean = true,
+    var autoRefreshDesktopAfterAppHandoff: Boolean = true,
 )
 
 const val DEFAULT_CODEX_COMMAND = "codex"

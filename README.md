@@ -53,13 +53,15 @@ gradle spotlessApply
 
 1. Install/run the plugin in a JetBrains IDE.
 2. Open the same project in the IDE.
-3. Configure `Settings | Tools | Codex CLI Bridge` if `codex` is not the command you want, or if you want to turn automatic IDE context on or off.
+3. Configure `Settings | Tools | Codex CLI Bridge` if `codex` is not the command you want, or if you want to turn automatic IDE context or Desktop handoff refresh on or off.
 4. Click the Codex toolbar icon or use `Tools | Start Codex`.
 5. Send a prompt.
 
-The plugin enables `/ide` automatically after Codex is ready. It watches the terminal for the Codex prompt, then sends `/ide on`. You can turn this off in `Settings | Tools | Codex CLI Bridge`.
+The plugin enables `/ide` automatically after Codex is ready. It watches the terminal for the Codex prompt, then sends `/ide on`. After startup, pressing Enter in the active Codex terminal starts a five-second fast check; if Codex leaves the ready state or loses its IDE indicator, the plugin waits up to 180 seconds for readiness and restores `/ide`. You can turn this off in `Settings | Tools | Codex CLI Bridge`.
 
 Codex will fetch fresh IDE context immediately before the outgoing prompt.
+
+When `/app` opens the current task in Codex Desktop, the plugin automatically asks the Desktop renderer to resume that task through Codex local IPC. The trigger matches the complete Codex success line and consumes each rendered handoff only once. This best-effort refresh is enabled by default and can be disabled in `Settings | Tools | Codex CLI Bridge`; failures are silent and do not affect the terminal session.
 
 ## License
 
