@@ -246,6 +246,30 @@ class TerminalProcessDetectionTest {
     }
 
     @Test
+    fun `waits indefinitely while idle when enter tracking is available`() {
+        assertEquals(
+            0L,
+            monitorPollMillis(
+                initialIdeMonitoring = false,
+                initialEnableDeadlineMillis = 0L,
+                enterInteraction = null,
+                hasKeyActivityTracker = true,
+                nowMillis = 0L,
+            ),
+        )
+        assertEquals(
+            1_500L,
+            monitorPollMillis(
+                initialIdeMonitoring = false,
+                initialEnableDeadlineMillis = 0L,
+                enterInteraction = null,
+                hasKeyActivityTracker = false,
+                nowMillis = 0L,
+            ),
+        )
+    }
+
+    @Test
     fun `waits up to 180 seconds when terminal leaves ready state`() {
         val interaction = TerminalEnterInteraction(
             enteredAtMillis = 1_000L,

@@ -13,6 +13,7 @@
  */
 package com.noorall.codex.bridge
 
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
@@ -21,6 +22,7 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.util.Disposer
 import java.awt.Component
 import java.awt.Container
 import java.awt.KeyEventDispatcher
@@ -219,7 +221,7 @@ internal class TerminalProcessTracker {
     }
 }
 
-internal class TerminalMonitorControl {
+internal class TerminalMonitorControl : Disposable {
     private val active = AtomicBoolean(true)
     private val task = AtomicReference<Future<*>?>()
 
@@ -247,6 +249,10 @@ internal class TerminalMonitorControl {
     fun completed() {
         active.set(false)
         task.set(null)
+    }
+
+    override fun dispose() {
+        stop()
     }
 }
 
@@ -575,6 +581,7 @@ private fun monitorCodexSession(
     session: CodexTerminalSession,
     autoEnableIdeContext: Boolean,
 ) {
+    Disposer.register(project, session.monitorControl)
     val task = ApplicationManager.getApplication().executeOnPooledThread {
         val widget = session.widget
         var canManageIdeMode = autoEnableIdeContext
@@ -717,6 +724,7 @@ private fun monitorCodexSession(
         } finally {
             keyActivityTracker?.close()
             session.monitorControl.completed()
+            Disposer.dispose(session.monitorControl)
         }
     }
     session.monitorControl.attach(task)
@@ -747,7 +755,7 @@ private fun isCodexExitMarkerVisible(session: CodexTerminalSession): Boolean {
     return hasCodexExitMarker(terminalText, exitMarker)
 }
 
-private fun monitorPollMillis(
+internal fun monitorPollMillis(
     initialIdeMonitoring: Boolean,
     initialEnableDeadlineMillis: Long,
     enterInteraction: TerminalEnterInteraction?,
@@ -762,7 +770,7 @@ private fun monitorPollMillis(
     }
     enterInteraction?.let { return it.pollMillis(nowMillis) }
     return if (hasKeyActivityTracker) {
-        CODEX_MONITOR_IDLE_HEALTH_POLL_MILLIS
+        CODEX_MONITOR_IDLE_WAIT_MILLIS
     } else {
         CODEX_MONITOR_IDLE_FALLBACK_POLL_MILLIS
     }
@@ -1392,7 +1400,7 @@ private const val TERMINAL_ENTER_INPUT = "\r"
 private const val CODEX_READY_POLL_MILLIS = 250L
 private const val CODEX_ENTER_FAST_POLL_DURATION_MILLIS = 5000L
 private const val CODEX_MONITOR_IDLE_FALLBACK_POLL_MILLIS = 1500L
-private const val CODEX_MONITOR_IDLE_HEALTH_POLL_MILLIS = 30000L
+private const val CODEX_MONITOR_IDLE_WAIT_MILLIS = 0L
 private const val CODEX_MONITOR_TAIL_CHARS = 16000
 private const val CODEX_TERMINAL_MISSING_MAX_POLLS = 80
 private const val CODEX_TERMINAL_INPUT_QUIET_MILLIS = 1000L

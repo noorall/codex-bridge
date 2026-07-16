@@ -16,7 +16,6 @@ package com.noorall.codex.bridge
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
-import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.Editor
@@ -290,14 +289,14 @@ private fun compactFileLabel(label: String): String {
     return "..." + label.takeLast(MAX_STATUS_FILE_LABEL_CHARS - 3)
 }
 
-private fun collectIdeContext(project: Project): IdeContext = ReadAction.compute<IdeContext, RuntimeException> {
+private fun collectIdeContext(project: Project): IdeContext {
     val editor = FileEditorManager.getInstance(project).selectedTextEditor
     val activeFile = editor?.let { currentEditor ->
         val file = FileDocumentManager.getInstance().getFile(currentEditor.document)
         if (file == null) null else activeFile(project, currentEditor, file)
     }
 
-    IdeContext(
+    return IdeContext(
         activeFile = activeFile,
         openTabs = FileEditorManager.getInstance(project)
             .openFiles
