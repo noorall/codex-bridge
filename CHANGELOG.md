@@ -1,11 +1,18 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.2] - 2026-07-17
 
 ### Added
 
-- Refresh Codex Desktop sessions through local IPC after successful `/app` handoffs, with a default-enabled setting.
-- Trigger terminal checks from Enter in the active Codex terminal, with a five-second fast scan and bounded ready-state recovery.
+- Automatically refresh Codex Desktop session content after successful `/app` handoffs, with a default-enabled setting.
+
+### Changed
+
+- Improve terminal monitoring performance and reduce idle resource usage.
+
+### Fixed
+
+- Improve terminal monitor lifecycle cleanup and IntelliJ Platform API compatibility for better overall stability.
 
 ## [0.1.1] - 2026-07-13
 
