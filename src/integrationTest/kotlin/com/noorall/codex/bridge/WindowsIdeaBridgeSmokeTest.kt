@@ -31,8 +31,11 @@ import org.kodein.di.bindSingleton
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipInputStream
 import kotlin.time.Duration.Companion.minutes
 
 class WindowsIdeaBridgeSmokeTest {
@@ -61,6 +64,7 @@ class WindowsIdeaBridgeSmokeTest {
 
         val ideaVersion = System.getProperty("codex.bridge.integration.ide.version")
         val pluginPath = File(requireNotNull(System.getProperty("path.to.build.plugin")))
+        val pluginFolder = extractPluginFolder(pluginPath)
         val projectPath = Path.of("src", "integrationTest", "testData", "windows-smoke").toAbsolutePath().normalize()
 
         Starter.newContext(
@@ -70,11 +74,43 @@ class WindowsIdeaBridgeSmokeTest {
                 LocalProjectInfo(projectPath),
             ).withVersion(ideaVersion),
         ).apply {
-            PluginConfigurator(this).installPluginFromFolder(pluginPath)
+            PluginConfigurator(this).installPluginFromFolder(pluginFolder)
         }.runIdeWithDriver().useDriverAndCloseIde {
             waitForIndicators(2.minutes)
             waitForNamedPipeConnection()
         }
+    }
+
+    private fun extractPluginFolder(pluginPath: File): File {
+        if (pluginPath.isDirectory) {
+            return pluginPath
+        }
+
+        val extractionRoot = Files.createTempDirectory("codex-bridge-plugin-")
+        ZipInputStream(pluginPath.inputStream().buffered()).use { archive ->
+            while (true) {
+                val entry = archive.nextEntry ?: break
+                val target = extractionRoot.resolve(entry.name).normalize()
+                require(target.startsWith(extractionRoot)) {
+                    "Plugin archive contains an invalid path: ${entry.name}"
+                }
+                if (entry.isDirectory) {
+                    Files.createDirectories(target)
+                } else {
+                    Files.createDirectories(target.parent)
+                    Files.copy(archive, target, StandardCopyOption.REPLACE_EXISTING)
+                }
+                archive.closeEntry()
+            }
+        }
+
+        val pluginDirectories = Files.list(extractionRoot).use { entries ->
+            entries.filter(Files::isDirectory).toList()
+        }
+        require(pluginDirectories.size == 1) {
+            "Expected one plugin directory in ${pluginPath.absolutePath}, found ${pluginDirectories.size}"
+        }
+        return pluginDirectories.single().toFile()
     }
 
     private fun waitForNamedPipeConnection() {
