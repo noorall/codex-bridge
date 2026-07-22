@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.3] - 2026-07-22
+
+### Added
+
+- Automatically connect JetBrains IDE context when Codex Desktop starts after the IDE.
+
+### Changed
+
+- Fix IDE bridge startup failures on Windows in current JetBrains IDE releases.
+- Improve handling when IDE context cannot be enabled.
+- Improve IDE context connection recovery and lifecycle stability when Codex Desktop restarts or disconnects.
+- Improve compatibility with the latest Codex IDE context routing while retaining existing Codex CLI integrations.
+
 ## [0.1.2] - 2026-07-17
 
 ### Added
