@@ -29,6 +29,7 @@ sourceSets {
 val integrationTestImplementation by configurations.getting {
     extendsFrom(configurations.testImplementation.get())
 }
+val integrationTestRuntimeOnly by configurations.getting
 
 val integrationIdeVersion = providers.gradleProperty("integrationIdeVersion").orElse("2025.2.6.2")
 val integrationFrameworkVersion = providers.gradleProperty("integrationFrameworkVersion").orElse("252.28539.54")
@@ -137,7 +138,8 @@ dependencies {
         )
     }
 
-    integrationTestImplementation("org.junit.jupiter:junit-jupiter:5.7.1")
+    integrationTestImplementation("org.junit.jupiter:junit-jupiter:5.12.2")
+    integrationTestRuntimeOnly("org.junit.platform:junit-platform-launcher:1.12.2")
     integrationTestImplementation("org.kodein.di:kodein-di-jvm:7.20.2")
     integrationTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.10.1")
 }
