@@ -55,7 +55,7 @@ jobs:
 
       - name: Build and test in IntelliJ IDEA on Windows
         shell: pwsh
-        run: gradle --no-daemon clean check buildPlugin integrationTest -PintegrationIdeVersion=2025.2.6.2
+        run: gradle --no-daemon clean check buildPlugin integrationTest "-PintegrationIdeVersion=2025.2.6.2"
 
       - name: Upload Windows IDEA diagnostics
         if: always()
