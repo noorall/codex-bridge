@@ -19,6 +19,17 @@ repositories {
     }
 }
 
+sourceSets {
+    create("integrationTest") {
+        compileClasspath += sourceSets.main.get().output
+        runtimeClasspath += sourceSets.main.get().output
+    }
+}
+
+val integrationTestImplementation by configurations.getting {
+    extendsFrom(configurations.testImplementation.get())
+}
+
 fun latestChangelogHtml(changelogFile: java.io.File): String {
     if (!changelogFile.isFile) {
         return ""
@@ -116,7 +127,15 @@ dependencies {
         bundledPlugin("org.jetbrains.plugins.terminal")
         pluginVerifier()
         testFramework(org.jetbrains.intellij.platform.gradle.TestFrameworkType.Platform)
+        testFramework(
+            org.jetbrains.intellij.platform.gradle.TestFrameworkType.Starter,
+            configurationName = "integrationTestImplementation",
+        )
     }
+
+    integrationTestImplementation("org.junit.jupiter:junit-jupiter:5.7.1")
+    integrationTestImplementation("org.kodein.di:kodein-di-jvm:7.20.2")
+    integrationTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.10.1")
 }
 
 spotless {
@@ -168,6 +187,19 @@ intellijPlatform {
                 VerifyPluginTask.FailureLevel.INVALID_PLUGIN,
             ),
         )
+    }
+}
+
+val integrationTest by intellijPlatformTesting.testIdeUi.registering {
+    task {
+        val integrationTestSourceSet = sourceSets.getByName("integrationTest")
+        testClassesDirs = integrationTestSourceSet.output.classesDirs
+        classpath = integrationTestSourceSet.runtimeClasspath
+        systemProperty(
+            "codex.bridge.integration.ide.version",
+            providers.gradleProperty("integrationIdeVersion").getOrElse("2025.2.6.2"),
+        )
+        useJUnitPlatform()
     }
 }
 
