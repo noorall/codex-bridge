@@ -30,6 +30,9 @@ val integrationTestImplementation by configurations.getting {
     extendsFrom(configurations.testImplementation.get())
 }
 
+val integrationIdeVersion = providers.gradleProperty("integrationIdeVersion").orElse("2025.2.6.2")
+val integrationFrameworkVersion = providers.gradleProperty("integrationFrameworkVersion").orElse("252.28539.54")
+
 fun latestChangelogHtml(changelogFile: java.io.File): String {
     if (!changelogFile.isFile) {
         return ""
@@ -129,6 +132,7 @@ dependencies {
         testFramework(org.jetbrains.intellij.platform.gradle.TestFrameworkType.Platform)
         testFramework(
             org.jetbrains.intellij.platform.gradle.TestFrameworkType.Starter,
+            version = integrationFrameworkVersion,
             configurationName = "integrationTestImplementation",
         )
     }
@@ -197,7 +201,7 @@ val integrationTest by intellijPlatformTesting.testIdeUi.registering {
         classpath = integrationTestSourceSet.runtimeClasspath
         systemProperty(
             "codex.bridge.integration.ide.version",
-            providers.gradleProperty("integrationIdeVersion").getOrElse("2025.2.6.2"),
+            integrationIdeVersion.get(),
         )
         useJUnitPlatform()
     }

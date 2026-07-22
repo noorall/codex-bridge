@@ -75,7 +75,7 @@ class WindowsIdeaBridgeSmokeTest {
                 LocalProjectInfo(projectPath),
             ).withVersion(ideaVersion),
         ).apply {
-            PluginConfigurator(this).installPluginFromFolder(pluginFolder)
+            PluginConfigurator(this).installPluginFromDir(pluginFolder.toPath())
         }.runIdeWithDriver().useDriverAndCloseIde {
             waitForIndicators(2.minutes)
             waitForNamedPipeConnection()
