@@ -39,16 +39,22 @@ import java.nio.channels.Selector
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
+import java.nio.file.ClosedWatchServiceException
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.StandardWatchEventKinds.ENTRY_CREATE
+import java.nio.file.StandardWatchEventKinds.ENTRY_DELETE
+import java.nio.file.WatchService
 import java.nio.file.attribute.PosixFilePermission
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.io.path.exists
 
 @Service
@@ -60,6 +66,15 @@ class CodexIpcService : Disposable {
 
     @Volatile
     private var sharedBridge: IpcBridge? = null
+
+    @Volatile
+    private var codexHomeBridge: UnixRouterClientBridge? = null
+
+    @Volatile
+    private var codexHomeWatcher: UnixSocketFileWatcher? = null
+
+    @Volatile
+    private var disposed = false
 
     fun registerProject(project: Project) {
         val basePath = project.basePath ?: return
@@ -81,20 +96,28 @@ class CodexIpcService : Disposable {
         if (project.basePath == null) {
             throw IOException("Project has no base path")
         }
-        sharedBridge?.takeIf { it.isOpen }?.let {
-            return
+        if (disposed) {
+            throw IOException("Codex IDE context bridge is disposed")
         }
-        sharedBridge?.close()
 
-        val bridge = bindSharedBridge()
-        sharedBridge = bridge
-        log.info("Codex IDE context bridge active on ${bridge.endpointDescription}")
-        executor.execute {
-            try {
-                runBridge(bridge, project)
-            } finally {
-                clearSharedBridge(bridge)
+        if (sharedBridge?.isOpen != true) {
+            sharedBridge?.close()
+
+            val bridge = bindSharedBridge()
+            sharedBridge = bridge
+            log.info("Codex IDE context bridge active on ${bridge.endpointDescription}")
+            executor.execute {
+                try {
+                    runBridge(bridge, project)
+                } finally {
+                    clearSharedBridge(bridge)
+                    scheduleSharedBridgeRestart()
+                }
             }
+        }
+
+        if (!isWindows()) {
+            ensureCodexHomeWatcher(project)
         }
     }
 
@@ -103,17 +126,10 @@ class CodexIpcService : Disposable {
             return WindowsNamedPipeBridge()
         }
 
-        val codexHome = defaultCodexHome()
         val systemTempDir = baseTempDir()
         val uid = currentUid()
-        val codexHomeSocketExists = codexHome.resolve("ipc").resolve("ipc.sock").normalize().exists()
-        val socketPath = selectUnixIpcSocketPath(
-            codexHome = codexHome,
-            systemTempDir = systemTempDir,
-            uid = uid,
-            codexHomeSocketExists = codexHomeSocketExists,
-        )
-        if (codexHomeSocketExists) {
+        val socketPath = systemTempIpcSocketPath(systemTempDir, uid)
+        if (socketPath.exists()) {
             try {
                 return connectToUnixRouter(socketPath)
             } catch (error: IOException) {
@@ -122,25 +138,80 @@ class CodexIpcService : Disposable {
                 }
             }
         }
+        prepareSocketPath(socketPath)
+        val channel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
+        channel.bind(UnixDomainSocketAddress.of(socketPath))
+        return UnixSocketBridge(socketPath, channel)
+    }
 
-        val fallbackSocketPath = if (codexHomeSocketExists) {
-            systemTempIpcSocketPath(systemTempDir, uid)
-        } else {
-            socketPath
+    @Synchronized
+    private fun ensureCodexHomeWatcher(project: Project) {
+        if (codexHomeWatcher?.isOpen == true) {
+            return
         }
-        if (fallbackSocketPath.exists()) {
+        codexHomeWatcher?.close()
+
+        val socketPath = codexHomeIpcSocketPath(defaultCodexHome())
+        val watcher = UnixSocketFileWatcher(socketPath)
+        codexHomeWatcher = watcher
+        executor.execute {
             try {
-                return connectToUnixRouter(fallbackSocketPath)
-            } catch (error: IOException) {
-                if (isLiveUnixSocket(fallbackSocketPath)) {
-                    throw IOException("Could not join the active Codex IPC router at $fallbackSocketPath", error)
-                }
+                monitorCodexHomeRouter(watcher, project)
+            } finally {
+                clearCodexHomeWatcher(watcher)
+                scheduleCodexHomeWatcherRestart()
             }
         }
-        prepareSocketPath(fallbackSocketPath)
-        val channel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
-        channel.bind(UnixDomainSocketAddress.of(fallbackSocketPath))
-        return UnixSocketBridge(fallbackSocketPath, channel)
+    }
+
+    private fun monitorCodexHomeRouter(watcher: UnixSocketFileWatcher, project: Project) {
+        while (watcher.isOpen && !disposed) {
+            val socketAvailable = try {
+                watcher.awaitSocket()
+            } catch (error: IOException) {
+                if (watcher.isOpen && !disposed) {
+                    log.warn("Failed to watch the Codex home IPC directory", error)
+                    watcher.awaitRetry()
+                }
+                continue
+            }
+            if (!socketAvailable) {
+                return
+            }
+
+            val bridge = try {
+                connectToUnixRouter(watcher.socketPath)
+            } catch (error: IOException) {
+                log.debug("Codex home IPC router is not ready at ${watcher.socketPath}", error)
+                watcher.awaitRetry()
+                continue
+            }
+
+            if (!installCodexHomeBridge(watcher, bridge)) {
+                bridge.close()
+                return
+            }
+            log.info("Codex IDE context bridge joined ${bridge.endpointDescription}")
+            try {
+                handleRouterConnection(bridge, project)
+            } finally {
+                clearCodexHomeBridge(bridge)
+            }
+            watcher.awaitRetry()
+        }
+    }
+
+    @Synchronized
+    private fun installCodexHomeBridge(
+        watcher: UnixSocketFileWatcher,
+        bridge: UnixRouterClientBridge,
+    ): Boolean {
+        if (disposed || codexHomeWatcher !== watcher || !watcher.isOpen) {
+            return false
+        }
+        codexHomeBridge?.close()
+        codexHomeBridge = bridge
+        return true
     }
 
     private fun connectToUnixRouter(socketPath: Path): UnixRouterClientBridge {
@@ -334,6 +405,10 @@ class CodexIpcService : Disposable {
 
     @Synchronized
     private fun closeSharedBridge() {
+        codexHomeWatcher?.close()
+        codexHomeWatcher = null
+        codexHomeBridge?.close()
+        codexHomeBridge = null
         sharedBridge?.close()
         sharedBridge = null
     }
@@ -346,7 +421,72 @@ class CodexIpcService : Disposable {
         }
     }
 
+    @Synchronized
+    private fun clearCodexHomeBridge(bridge: UnixRouterClientBridge) {
+        if (codexHomeBridge === bridge) {
+            bridge.close()
+            codexHomeBridge = null
+        }
+    }
+
+    @Synchronized
+    private fun clearCodexHomeWatcher(watcher: UnixSocketFileWatcher) {
+        if (codexHomeWatcher === watcher) {
+            watcher.close()
+            codexHomeWatcher = null
+        }
+    }
+
+    private fun scheduleSharedBridgeRestart() {
+        if (disposed || projectsByPath.isEmpty() || executor.isShutdown) {
+            return
+        }
+        try {
+            executor.execute {
+                try {
+                    Thread.sleep(BRIDGE_RETRY_MILLIS)
+                    val project = projectsByPath.values.firstOrNull { !it.isDisposed } ?: return@execute
+                    ensureListening(project)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } catch (error: Throwable) {
+                    if (!disposed && projectsByPath.isNotEmpty()) {
+                        log.warn("Failed to restart the Codex IDE context bridge", error)
+                        scheduleSharedBridgeRestart()
+                    }
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            // The application is already disposing the service.
+        }
+    }
+
+    private fun scheduleCodexHomeWatcherRestart() {
+        if (disposed || projectsByPath.isEmpty() || executor.isShutdown) {
+            return
+        }
+        try {
+            executor.execute {
+                try {
+                    Thread.sleep(BRIDGE_RETRY_MILLIS)
+                    val project = projectsByPath.values.firstOrNull { !it.isDisposed } ?: return@execute
+                    ensureCodexHomeWatcher(project)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } catch (error: Throwable) {
+                    if (!disposed && projectsByPath.isNotEmpty()) {
+                        log.warn("Failed to restart the Codex home IPC watcher", error)
+                        scheduleCodexHomeWatcherRestart()
+                    }
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            // The application is already disposing the service.
+        }
+    }
+
     override fun dispose() {
+        disposed = true
         closeSharedBridge()
         executor.shutdownNow()
     }
@@ -429,10 +569,84 @@ private const val MAX_FRAME_BYTES = 256 * 1024 * 1024
 private const val CLIENT_ID = "jetbrains-client"
 private const val WINDOWS_PIPE_NAME = "\\\\.\\pipe\\codex-ipc"
 private const val ROUTER_CONNECT_TIMEOUT_MILLIS = 5000L
+private const val BRIDGE_RETRY_MILLIS = 1000L
 
 private interface IpcBridge : Closeable {
     val endpointDescription: String
     val isOpen: Boolean
+}
+
+internal class UnixSocketFileWatcher(
+    val socketPath: Path,
+    private val retryMillis: Long = BRIDGE_RETRY_MILLIS,
+) : Closeable {
+    private val currentWatchService = AtomicReference<WatchService?>()
+
+    @Volatile
+    private var closed = false
+
+    val isOpen: Boolean
+        get() = !closed
+
+    fun awaitSocket(): Boolean {
+        while (isOpen) {
+            if (socketPath.exists()) {
+                return true
+            }
+
+            val watchDirectory = nearestExistingDirectory(socketPath)
+                ?: throw IOException("No existing directory can be watched for $socketPath")
+            val watchService = FileSystems.getDefault().newWatchService()
+            if (!currentWatchService.compareAndSet(null, watchService)) {
+                watchService.close()
+                throw IOException("Codex home IPC watcher is already waiting")
+            }
+
+            try {
+                if (!isOpen) {
+                    return false
+                }
+                watchDirectory.register(watchService, ENTRY_CREATE, ENTRY_DELETE)
+                if (socketPath.exists()) {
+                    return true
+                }
+
+                val key = try {
+                    watchService.take()
+                } catch (_: ClosedWatchServiceException) {
+                    return false
+                }
+                key.pollEvents()
+                key.reset()
+            } finally {
+                currentWatchService.compareAndSet(watchService, null)
+                try {
+                    watchService.close()
+                } catch (_: IOException) {
+                }
+            }
+        }
+        return false
+    }
+
+    fun awaitRetry() {
+        if (!isOpen) {
+            return
+        }
+        try {
+            Thread.sleep(retryMillis)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    override fun close() {
+        closed = true
+        try {
+            currentWatchService.getAndSet(null)?.close()
+        } catch (_: IOException) {
+        }
+    }
 }
 
 private data class UnixSocketBridge(
@@ -720,21 +934,23 @@ private fun JsonObject.objectField(name: String): JsonObject? {
     return get(name)?.takeIf { it.isJsonObject }?.asJsonObject
 }
 
-internal fun selectUnixIpcSocketPath(
-    codexHome: Path,
-    systemTempDir: Path,
-    uid: Long,
-    codexHomeSocketExists: Boolean,
-): Path {
-    return if (codexHomeSocketExists) {
-        codexHome.resolve("ipc").resolve("ipc.sock").normalize()
-    } else {
-        systemTempIpcSocketPath(systemTempDir, uid)
-    }
+internal fun codexHomeIpcSocketPath(codexHome: Path): Path {
+    return codexHome.resolve("ipc").resolve("ipc.sock").normalize()
 }
 
-private fun systemTempIpcSocketPath(systemTempDir: Path, uid: Long): Path {
+internal fun systemTempIpcSocketPath(systemTempDir: Path, uid: Long): Path {
     return systemTempDir.resolve("codex-ipc").resolve("ipc-$uid.sock").normalize()
+}
+
+internal fun nearestExistingDirectory(path: Path): Path? {
+    var candidate = path.toAbsolutePath().normalize().parent
+    while (candidate != null) {
+        if (Files.isDirectory(candidate)) {
+            return candidate
+        }
+        candidate = candidate.parent
+    }
+    return null
 }
 
 private fun defaultCodexHome(): Path {

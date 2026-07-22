@@ -32,9 +32,11 @@ import java.nio.ByteOrder
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.Executors
 import java.util.concurrent.FutureTask
+import java.util.concurrent.TimeUnit
 import javax.swing.JPanel
 import javax.swing.JTextField
 
@@ -43,29 +45,55 @@ class TerminalProcessDetectionTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
-    fun `prefers a shared Codex home IPC socket`() {
+    fun `uses the shared Codex home IPC socket for the desktop router`() {
         assertEquals(
             Path.of("/home/test/.codex/ipc/ipc.sock"),
-            selectUnixIpcSocketPath(
-                codexHome = Path.of("/home/test/.codex"),
-                systemTempDir = Path.of("/system/tmp"),
-                uid = 1000L,
-                codexHomeSocketExists = true,
-            ),
+            codexHomeIpcSocketPath(Path.of("/home/test/.codex")),
         )
     }
 
     @Test
-    fun `falls back to the native system temp IPC socket`() {
+    fun `keeps the native system temp IPC socket independent`() {
         assertEquals(
             Path.of("/system/tmp/codex-ipc/ipc-1000.sock"),
-            selectUnixIpcSocketPath(
-                codexHome = Path.of("/missing/.codex"),
-                systemTempDir = Path.of("/system/tmp"),
-                uid = 1000L,
-                codexHomeSocketExists = false,
-            ),
+            systemTempIpcSocketPath(Path.of("/system/tmp"), 1000L),
         )
+    }
+
+    @Test
+    fun `detects a Codex home IPC socket created after startup`() {
+        val codexHome = temporaryFolder.root.toPath().resolve("created-later").resolve(".codex")
+        val socketPath = codexHomeIpcSocketPath(codexHome)
+        val watcher = UnixSocketFileWatcher(socketPath, retryMillis = 10L)
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            val detected = executor.submit<Boolean> { watcher.awaitSocket() }
+            Files.createDirectories(socketPath.parent)
+            Files.createFile(socketPath)
+
+            assertTrue(detected.get(5L, TimeUnit.SECONDS))
+        } finally {
+            watcher.close()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `closing the Codex home watcher releases a blocked wait`() {
+        val socketPath = temporaryFolder.root.toPath().resolve("missing").resolve("ipc.sock")
+        val watcher = UnixSocketFileWatcher(socketPath, retryMillis = 10L)
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            val detected = executor.submit<Boolean> { watcher.awaitSocket() }
+            watcher.close()
+
+            assertFalse(detected.get(5L, TimeUnit.SECONDS))
+        } finally {
+            watcher.close()
+            executor.shutdownNow()
+        }
     }
 
     @Test
