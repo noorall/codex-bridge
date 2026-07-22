@@ -13,7 +13,6 @@
  */
 package com.noorall.codex.bridge
 
-import com.intellij.driver.sdk.waitForIndicators
 import com.intellij.ide.starter.ci.CIServer
 import com.intellij.ide.starter.ci.NoCIServer
 import com.intellij.ide.starter.di.di
@@ -23,6 +22,7 @@ import com.intellij.ide.starter.models.TestCase
 import com.intellij.ide.starter.plugins.PluginConfigurator
 import com.intellij.ide.starter.project.LocalProjectInfo
 import com.intellij.ide.starter.runner.Starter
+import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.fail
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
@@ -36,7 +36,6 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
-import kotlin.time.Duration.Companion.minutes
 
 class WindowsIdeaBridgeSmokeTest {
     init {
@@ -68,7 +67,7 @@ class WindowsIdeaBridgeSmokeTest {
         requireNoBundledJna(pluginFolder)
         val projectPath = Path.of("src", "integrationTest", "testData", "windows-smoke").toAbsolutePath().normalize()
 
-        Starter.newContext(
+        val backgroundRun = Starter.newContext(
             testName = "windowsIdeaBridge",
             testCase = TestCase(
                 IdeProductProvider.IC,
@@ -76,9 +75,17 @@ class WindowsIdeaBridgeSmokeTest {
             ).withVersion(ideaVersion),
         ).apply {
             PluginConfigurator(this).installPluginFromDir(pluginFolder.toPath())
-        }.runIdeWithDriver().useDriverAndCloseIde {
-            waitForIndicators(2.minutes)
+        }.runIdeWithDriver()
+
+        try {
             waitForNamedPipeConnection()
+        } finally {
+            if (backgroundRun.process.isAlive) {
+                backgroundRun.process.kill()
+            }
+            runBlocking {
+                runCatching { backgroundRun.startResult.await() }
+            }
         }
     }
 

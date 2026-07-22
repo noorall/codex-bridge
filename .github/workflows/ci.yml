@@ -68,5 +68,7 @@ jobs:
             build/idea-sandbox/**/log
             build/**/idea.log
             build/**/errors
+            out/ide-tests/tests/**/log/idea.log
+            out/ide-tests/tests/**/log/errors
           retention-days: 7
           if-no-files-found: warn
