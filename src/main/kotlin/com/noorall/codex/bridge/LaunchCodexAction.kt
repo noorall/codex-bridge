@@ -62,14 +62,14 @@ class LaunchCodexAction : AnAction() {
         val command = settings.codexCommand.trim()
         val autoEnableIdeContext = settings.autoEnableIdeContext
         val bridge = service<CodexIpcService>()
-        val tmpDir = try {
+        try {
             bridge.ensureListening(project)
         } catch (error: Throwable) {
             Messages.showErrorDialog(project, "Could not start Codex IDE bridge:\n${error.message}", "Codex")
             return
         }
 
-        val terminalLaunch = buildTerminalLaunch(command, tmpDir, project.basePath)
+        val terminalLaunch = buildTerminalLaunch(command, project.basePath)
         try {
             openIdeTerminal(project, terminalLaunch, autoEnableIdeContext)
         } catch (error: Throwable) {
@@ -78,15 +78,14 @@ class LaunchCodexAction : AnAction() {
     }
 }
 
-private data class TerminalLaunch(
+internal data class TerminalLaunch(
     val command: String,
     val fallbackCommand: String,
     val workingDirectory: String,
-    val env: Map<String, String>,
     val exitMarker: String?,
 )
 
-private fun buildTerminalLaunch(command: String, tmpDir: Path, basePath: String?): TerminalLaunch {
+internal fun buildTerminalLaunch(command: String, basePath: String?): TerminalLaunch {
     val codexCommand = command.ifBlank { DEFAULT_CODEX_COMMAND }
     val workingDirectory = basePath ?: System.getProperty("user.home")
     val windows = isWindows()
@@ -97,17 +96,11 @@ private fun buildTerminalLaunch(command: String, tmpDir: Path, basePath: String?
         null
     }
     val monitoredCommand = exitMarker?.let { appendCodexExitMarker(codexCommand, it) } ?: codexCommand
-    val env = mapOf(
-        "TMPDIR" to tmpDir.toString(),
-        "CODEX_JETBRAINS_TMPDIR" to tmpDir.toString(),
-    )
     if (windows) {
-        return TerminalLaunch(monitoredCommand, monitoredCommand, workingDirectory, env, exitMarker)
+        return TerminalLaunch(monitoredCommand, monitoredCommand, workingDirectory, exitMarker)
     }
 
     val parts = mutableListOf<String>()
-    parts += "export TMPDIR=${shellQuote(tmpDir.toString())}"
-    parts += "export CODEX_JETBRAINS_TMPDIR=${shellQuote(tmpDir.toString())}"
     if (!basePath.isNullOrBlank()) {
         parts += "cd ${shellQuote(basePath)}"
     }
@@ -117,7 +110,6 @@ private fun buildTerminalLaunch(command: String, tmpDir: Path, basePath: String?
         command = listOf(CLEAR_TERMINAL_COMMAND, monitoredCommand).joinToString("; "),
         fallbackCommand = parts.joinToString("; "),
         workingDirectory = workingDirectory,
-        env = env,
         exitMarker = exitMarker,
     )
 }
@@ -346,7 +338,6 @@ private fun createReworkedTerminalSessionOnEdt(
     if (!invokeMethodIfPresent(builder, "workingDirectory", arrayOf(launch.workingDirectory))) {
         return null
     }
-    invokeMethodIfPresent(builder, "envVariables", arrayOf(launch.env))
     invokeMethodIfPresent(builder, "tabName", arrayOf(CODEX_TERMINAL_TITLE))
     invokeMethodIfPresent(builder, "requestFocus", arrayOf(true))
 

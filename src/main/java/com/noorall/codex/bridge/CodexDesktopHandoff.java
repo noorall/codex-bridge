@@ -372,9 +372,15 @@ public final class CodexDesktopHandoff {
         String tempDir = configuredTemp == null || configuredTemp.isBlank()
                 ? System.getProperty("java.io.tmpdir")
                 : configuredTemp;
-        return Path.of(tempDir)
-                .resolve("codex-ipc")
-                .resolve("ipc-" + currentUid() + ".sock");
+        return preferredSocketPath(defaultCodexHome(), Path.of(tempDir), currentUid());
+    }
+
+    static Path preferredSocketPath(Path codexHome, Path systemTempDir, long uid) {
+        Path primarySocket = codexHome.resolve("ipc").resolve("ipc.sock");
+        if (Files.exists(primarySocket)) {
+            return primarySocket;
+        }
+        return systemTempDir.resolve("codex-ipc").resolve("ipc-" + uid + ".sock");
     }
 
     private static long currentUid() throws ReflectiveOperationException {

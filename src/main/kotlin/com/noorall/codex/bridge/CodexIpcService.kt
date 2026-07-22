@@ -34,6 +34,8 @@ import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.ClosedByInterruptException
+import java.nio.channels.SelectionKey
+import java.nio.channels.Selector
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
@@ -42,10 +44,11 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.attribute.PosixFilePermission
-import java.security.MessageDigest
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ThreadFactory
+import java.util.concurrent.TimeUnit
 import kotlin.io.path.exists
 
 @Service
@@ -54,7 +57,9 @@ class CodexIpcService : Disposable {
     private val gson = Gson()
     private val projectsByPath = ConcurrentHashMap<String, Project>()
     private val executor = Executors.newCachedThreadPool(CodexThreadFactory())
-    private val projectBridges = ConcurrentHashMap<String, IpcBridge>()
+
+    @Volatile
+    private var sharedBridge: IpcBridge? = null
 
     fun registerProject(project: Project) {
         val basePath = project.basePath ?: return
@@ -66,59 +71,102 @@ class CodexIpcService : Disposable {
         val basePath = project.basePath ?: return
         val projectKey = normalizePath(basePath)
         projectsByPath.remove(projectKey, project)
-        if (isWindows()) {
-            if (projectsByPath.isEmpty()) {
-                projectBridges.remove(WINDOWS_PIPE_BRIDGE_KEY)?.close()
-            }
-        } else {
-            projectBridges.remove(projectKey)?.close()
+        if (projectsByPath.isEmpty()) {
+            closeSharedBridge()
         }
     }
-
-    fun tmpDirForProject(project: Project): Path = projectTmpDir(project)
 
     @Synchronized
-    fun ensureListening(project: Project): Path {
-        val basePath = project.basePath ?: throw IOException("Project has no base path")
-        val projectKey = normalizePath(basePath)
-        val bridgeKey = if (isWindows()) WINDOWS_PIPE_BRIDGE_KEY else projectKey
-        val tmpDir = projectTmpDir(project)
-
-        projectBridges[bridgeKey]?.takeIf { it.isOpen }?.let {
-            return tmpDir
+    fun ensureListening(project: Project) {
+        if (project.basePath == null) {
+            throw IOException("Project has no base path")
         }
-        projectBridges.remove(bridgeKey)
-
-        val bridge = bindProjectBridge(tmpDir)
-        val existing = projectBridges.putIfAbsent(bridgeKey, bridge)
-        if (existing != null) {
-            bridge.close()
-            return tmpDir
+        sharedBridge?.takeIf { it.isOpen }?.let {
+            return
         }
+        sharedBridge?.close()
 
-        log.info("Codex IDE context bridge listening on ${bridge.endpointDescription} for ${project.name}")
+        val bridge = bindSharedBridge()
+        sharedBridge = bridge
+        log.info("Codex IDE context bridge active on ${bridge.endpointDescription}")
         executor.execute {
-            acceptLoop(bridge, project)
+            try {
+                runBridge(bridge, project)
+            } finally {
+                clearSharedBridge(bridge)
+            }
         }
-        return tmpDir
     }
 
-    private fun bindProjectBridge(tmpDir: Path): IpcBridge {
+    private fun bindSharedBridge(): IpcBridge {
         if (isWindows()) {
-            return WindowsNamedPipeBridge(tmpDir)
+            return WindowsNamedPipeBridge()
         }
 
-        val socketPath = socketPathForTmpDir(tmpDir)
-        prepareSocketPath(socketPath)
+        val codexHome = defaultCodexHome()
+        val systemTempDir = baseTempDir()
+        val uid = currentUid()
+        val codexHomeSocketExists = codexHome.resolve("ipc").resolve("ipc.sock").normalize().exists()
+        val socketPath = selectUnixIpcSocketPath(
+            codexHome = codexHome,
+            systemTempDir = systemTempDir,
+            uid = uid,
+            codexHomeSocketExists = codexHomeSocketExists,
+        )
+        if (codexHomeSocketExists) {
+            try {
+                return connectToUnixRouter(socketPath)
+            } catch (error: IOException) {
+                if (isLiveUnixSocket(socketPath)) {
+                    throw IOException("Could not join the active Codex IPC router at $socketPath", error)
+                }
+            }
+        }
+
+        val fallbackSocketPath = if (codexHomeSocketExists) {
+            systemTempIpcSocketPath(systemTempDir, uid)
+        } else {
+            socketPath
+        }
+        if (fallbackSocketPath.exists()) {
+            try {
+                return connectToUnixRouter(fallbackSocketPath)
+            } catch (error: IOException) {
+                if (isLiveUnixSocket(fallbackSocketPath)) {
+                    throw IOException("Could not join the active Codex IPC router at $fallbackSocketPath", error)
+                }
+            }
+        }
+        prepareSocketPath(fallbackSocketPath)
         val channel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
-        channel.bind(UnixDomainSocketAddress.of(socketPath))
-        return UnixSocketBridge(tmpDir, socketPath, channel)
+        channel.bind(UnixDomainSocketAddress.of(fallbackSocketPath))
+        return UnixSocketBridge(fallbackSocketPath, channel)
     }
 
-    private fun acceptLoop(bridge: IpcBridge, project: Project) {
+    private fun connectToUnixRouter(socketPath: Path): UnixRouterClientBridge {
+        val initialized = initializeUnixRouterConnection(socketPath)
+        return UnixRouterClientBridge(
+            socketPath,
+            SocketChannelConnection(initialized.channel),
+            initialized.clientId,
+        )
+    }
+
+    private fun runBridge(bridge: IpcBridge, project: Project) {
         when (bridge) {
             is UnixSocketBridge -> acceptUnixSocketLoop(bridge.channel, project)
+            is UnixRouterClientBridge -> handleRouterConnection(bridge, project)
             is WindowsNamedPipeBridge -> acceptWindowsPipeLoop(bridge, project)
+        }
+    }
+
+    private fun handleRouterConnection(bridge: UnixRouterClientBridge, project: Project) {
+        try {
+            handleConnection(bridge.connection, project)
+        } catch (error: IOException) {
+            if (bridge.isOpen) {
+                log.warn("Lost the Codex IPC router connection", error)
+            }
         }
     }
 
@@ -178,19 +226,22 @@ class CodexIpcService : Disposable {
 
         return when (message.stringField("type")) {
             "request" -> handleRequest(message, project)
-            "client-discovery-request" -> discoveryResponse(message.stringField("requestId"))
+            "client-discovery-request" -> discoveryResponse(message)
             else -> null
         }
     }
 
-    private fun handleRequest(message: JsonObject, defaultProject: Project): String {
+    private fun handleRequest(message: JsonObject, defaultProject: Project?): String {
         val requestId = message.stringField("requestId")
         if (message.stringField("method") != "ide-context") {
             return errorResponse(requestId, "no-handler-for-request")
         }
 
         val workspaceRoot = message.objectField("params")?.stringField("workspaceRoot")
-        val project = selectProject(workspaceRoot) ?: defaultProject.takeUnless { it.isDisposed }
+        val project = selectProject(workspaceRoot)
+            ?: defaultProject
+                ?.takeIf { workspaceRoot.isNullOrBlank() }
+                ?.takeUnless { it.isDisposed }
             ?: return errorResponse(requestId, "no-client-found")
 
         val context = try {
@@ -253,12 +304,19 @@ class CodexIpcService : Disposable {
         return null
     }
 
-    private fun discoveryResponse(requestId: String?): String {
+    private fun discoveryResponse(message: JsonObject): String {
+        val request = message.objectField("request")
+        val canHandle = if (request == null) {
+            projectsByPath.values.any { !it.isDisposed }
+        } else {
+            request.stringField("method") == "ide-context" &&
+                selectProject(request.objectField("params")?.stringField("workspaceRoot")) != null
+        }
         return gson.toJson(
             mapOf(
                 "type" to "client-discovery-response",
-                "requestId" to requestId,
-                "response" to mapOf("canHandle" to true),
+                "requestId" to message.stringField("requestId"),
+                "response" to mapOf("canHandle" to canHandle),
             ),
         )
     }
@@ -274,26 +332,110 @@ class CodexIpcService : Disposable {
         )
     }
 
+    @Synchronized
+    private fun closeSharedBridge() {
+        sharedBridge?.close()
+        sharedBridge = null
+    }
+
+    @Synchronized
+    private fun clearSharedBridge(bridge: IpcBridge) {
+        if (sharedBridge === bridge) {
+            bridge.close()
+            sharedBridge = null
+        }
+    }
+
     override fun dispose() {
-        projectBridges.values.forEach { it.close() }
-        projectBridges.clear()
+        closeSharedBridge()
         executor.shutdownNow()
+    }
+}
+
+internal data class InitializedRouterConnection(
+    val channel: SocketChannel,
+    val clientId: String,
+)
+
+internal fun initializeUnixRouterConnection(
+    socketPath: Path,
+    timeoutMillis: Long = ROUTER_CONNECT_TIMEOUT_MILLIS,
+): InitializedRouterConnection {
+    val channel = SocketChannel.open(StandardProtocolFamily.UNIX)
+    try {
+        channel.configureBlocking(false)
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        val requestId = UUID.randomUUID().toString()
+        Selector.open().use { selector ->
+            val connected = channel.connect(UnixDomainSocketAddress.of(socketPath))
+            val key = channel.register(selector, 0)
+            if (!connected) {
+                awaitChannelReady(selector, key, SelectionKey.OP_CONNECT, deadlineNanos)
+                if (!channel.finishConnect()) {
+                    throw IOException("Codex IPC router connection did not complete")
+                }
+            }
+
+            val initializeRequest = Gson().toJson(
+                mapOf(
+                    "type" to "request",
+                    "requestId" to requestId,
+                    "sourceClientId" to "initializing-client",
+                    "version" to 0,
+                    "method" to "initialize",
+                    "params" to mapOf("clientType" to "jetbrains-ide-context"),
+                ),
+            )
+            writeFrameBeforeDeadline(channel, selector, key, initializeRequest, deadlineNanos)
+
+            while (true) {
+                val response = JsonParser.parseString(
+                    readFrameBeforeDeadline(channel, selector, key, deadlineNanos),
+                ).asJsonObject
+                if (
+                    response.stringField("type") != "response" ||
+                    response.stringField("requestId") != requestId
+                ) {
+                    continue
+                }
+                if (response.stringField("resultType") != "success") {
+                    throw IOException(
+                        "Codex IPC router initialize failed: " +
+                            (response.stringField("error") ?: "unknown error"),
+                    )
+                }
+                val clientId = response.objectField("result")?.stringField("clientId")
+                    ?.takeIf { it.isNotBlank() }
+                    ?: throw IOException("Codex IPC router initialize returned no client ID")
+                key.cancel()
+                selector.selectNow()
+                channel.configureBlocking(true)
+                return InitializedRouterConnection(channel, clientId)
+            }
+        }
+    } catch (error: Throwable) {
+        try {
+            channel.close()
+        } catch (_: IOException) {
+        }
+        if (error is IOException) {
+            throw error
+        }
+        throw IOException("Could not initialize the Codex IPC router connection", error)
     }
 }
 
 private const val MAX_FRAME_BYTES = 256 * 1024 * 1024
 private const val CLIENT_ID = "jetbrains-client"
-private const val WINDOWS_PIPE_BRIDGE_KEY = "windows-named-pipe"
 private const val WINDOWS_PIPE_NAME = "\\\\.\\pipe\\codex-ipc"
+private const val ROUTER_CONNECT_TIMEOUT_MILLIS = 5000L
 
 private interface IpcBridge : Closeable {
-    val tmpDir: Path
     val endpointDescription: String
     val isOpen: Boolean
 }
 
 private data class UnixSocketBridge(
-    override val tmpDir: Path,
     val socketPath: Path,
     val channel: ServerSocketChannel,
 ) : IpcBridge {
@@ -313,9 +455,21 @@ private data class UnixSocketBridge(
     }
 }
 
-private class WindowsNamedPipeBridge(
-    override val tmpDir: Path,
+private class UnixRouterClientBridge(
+    val socketPath: Path,
+    val connection: SocketChannelConnection,
+    val clientId: String,
 ) : IpcBridge {
+    override val endpointDescription: String = "$socketPath (router client $clientId)"
+    override val isOpen: Boolean
+        get() = connection.isOpen
+
+    override fun close() {
+        connection.close()
+    }
+}
+
+private class WindowsNamedPipeBridge : IpcBridge {
     @Volatile
     private var closed = false
     private val lock = Any()
@@ -414,6 +568,88 @@ private class SocketChannelConnection(
     }
 }
 
+private fun readFrameBeforeDeadline(
+    channel: SocketChannel,
+    selector: Selector,
+    key: SelectionKey,
+    deadlineNanos: Long,
+): String {
+    val lengthBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+    readFullyBeforeDeadline(channel, selector, key, lengthBuffer, deadlineNanos)
+    lengthBuffer.flip()
+    val length = lengthBuffer.int
+    if (length < 0 || length > MAX_FRAME_BYTES) {
+        throw IOException("Codex IPC router frame is too large: $length")
+    }
+    val payload = ByteBuffer.allocate(length)
+    readFullyBeforeDeadline(channel, selector, key, payload, deadlineNanos)
+    payload.flip()
+    return StandardCharsets.UTF_8.decode(payload).toString()
+}
+
+private fun writeFrameBeforeDeadline(
+    channel: SocketChannel,
+    selector: Selector,
+    key: SelectionKey,
+    message: String,
+    deadlineNanos: Long,
+) {
+    val payload = message.toByteArray(StandardCharsets.UTF_8)
+    if (payload.size > MAX_FRAME_BYTES) {
+        throw IOException("Codex IPC router frame is too large: ${payload.size}")
+    }
+    val frame = ByteBuffer.allocate(4 + payload.size).order(ByteOrder.LITTLE_ENDIAN)
+    frame.putInt(payload.size).put(payload).flip()
+    while (frame.hasRemaining()) {
+        if (channel.write(frame) == 0) {
+            awaitChannelReady(selector, key, SelectionKey.OP_WRITE, deadlineNanos)
+        }
+    }
+}
+
+private fun readFullyBeforeDeadline(
+    channel: SocketChannel,
+    selector: Selector,
+    key: SelectionKey,
+    buffer: ByteBuffer,
+    deadlineNanos: Long,
+) {
+    while (buffer.hasRemaining()) {
+        val count = channel.read(buffer)
+        if (count < 0) {
+            throw EOFException("Codex IPC router closed the connection")
+        }
+        if (count == 0) {
+            awaitChannelReady(selector, key, SelectionKey.OP_READ, deadlineNanos)
+        }
+    }
+}
+
+private fun awaitChannelReady(
+    selector: Selector,
+    key: SelectionKey,
+    operation: Int,
+    deadlineNanos: Long,
+) {
+    while (true) {
+        val remainingNanos = deadlineNanos - System.nanoTime()
+        if (remainingNanos <= 0L) {
+            throw IOException("Timed out waiting for the Codex IPC router")
+        }
+        key.interestOps(operation)
+        val timeoutMillis = maxOf(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos))
+        val selected = selector.select(timeoutMillis)
+        val ready = selector.selectedKeys().any { selectedKey ->
+            selectedKey === key && (selectedKey.readyOps() and operation) != 0
+        }
+        selector.selectedKeys().clear()
+        key.interestOps(0)
+        if (selected > 0 && ready) {
+            return
+        }
+    }
+}
+
 private class WindowsPipeConnection(
     private val handle: Pointer,
     private val onClose: () -> Unit,
@@ -484,16 +720,28 @@ private fun JsonObject.objectField(name: String): JsonObject? {
     return get(name)?.takeIf { it.isJsonObject }?.asJsonObject
 }
 
-private fun socketPathForTmpDir(tmpDir: Path): Path {
-    return tmpDir.resolve("codex-ipc").resolve("ipc-${currentUid()}.sock").normalize()
+internal fun selectUnixIpcSocketPath(
+    codexHome: Path,
+    systemTempDir: Path,
+    uid: Long,
+    codexHomeSocketExists: Boolean,
+): Path {
+    return if (codexHomeSocketExists) {
+        codexHome.resolve("ipc").resolve("ipc.sock").normalize()
+    } else {
+        systemTempIpcSocketPath(systemTempDir, uid)
+    }
 }
 
-private fun projectTmpDir(project: Project): Path {
-    val basePath = project.basePath ?: project.name
-    return baseTempDir()
-        .resolve("codex-bridge")
-        .resolve(shortHash(basePath))
-        .normalize()
+private fun systemTempIpcSocketPath(systemTempDir: Path, uid: Long): Path {
+    return systemTempDir.resolve("codex-ipc").resolve("ipc-$uid.sock").normalize()
+}
+
+private fun defaultCodexHome(): Path {
+    return System.getenv("CODEX_HOME")
+        ?.takeIf { it.isNotBlank() }
+        ?.let(Paths::get)
+        ?: Paths.get(System.getProperty("user.home"), ".codex")
 }
 
 private fun baseTempDir(): Path {
@@ -501,11 +749,6 @@ private fun baseTempDir(): Path {
         ?.takeIf { it.isNotBlank() }
         ?.let { Paths.get(it) }
         ?: Paths.get(System.getProperty("java.io.tmpdir"))
-}
-
-private fun shortHash(value: String): String {
-    val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(StandardCharsets.UTF_8))
-    return digest.take(8).joinToString("") { "%02x".format(it) }
 }
 
 private fun currentUid(): Long {

@@ -47,6 +47,29 @@ public class CodexDesktopHandoffTest {
     @Rule public final TemporaryFolder temporaryFolder = new TemporaryFolder();
 
     @Test
+    public void prefersCodexHomeSocketForDesktopRefresh() throws Exception {
+        Path codexHome = temporaryFolder.newFolder("codex-home-ipc").toPath();
+        Path systemTemp = temporaryFolder.newFolder("system-temp").toPath();
+        Path primarySocket = codexHome.resolve("ipc/ipc.sock");
+        Files.createDirectories(primarySocket.getParent());
+        Files.createFile(primarySocket);
+
+        assertEquals(
+                primarySocket,
+                CodexDesktopHandoff.preferredSocketPath(codexHome, systemTemp, 1000L));
+    }
+
+    @Test
+    public void fallsBackToSystemTempForDesktopRefresh() throws Exception {
+        Path codexHome = temporaryFolder.newFolder("codex-home-without-ipc").toPath();
+        Path systemTemp = temporaryFolder.newFolder("desktop-system-temp").toPath();
+
+        assertEquals(
+                systemTemp.resolve("codex-ipc/ipc-1000.sock"),
+                CodexDesktopHandoff.preferredSocketPath(codexHome, systemTemp, 1000L));
+    }
+
+    @Test
     public void findsMostRecentCliRolloutForCurrentProject() throws Exception {
         Path codexHome = temporaryFolder.newFolder("codex-home").toPath();
         Path sessions = codexHome.resolve("sessions/2026/07/15");

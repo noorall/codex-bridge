@@ -13,17 +13,112 @@
  */
 package com.noorall.codex.bridge
 
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import com.noorall.codex.bridge.fixture.hiddenTerminalWidget
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 import java.awt.event.KeyEvent
+import java.net.StandardProtocolFamily
+import java.net.UnixDomainSocketAddress
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.ServerSocketChannel
+import java.nio.channels.SocketChannel
+import java.nio.charset.StandardCharsets
+import java.nio.file.Path
+import java.util.concurrent.Executors
 import java.util.concurrent.FutureTask
 import javax.swing.JPanel
 import javax.swing.JTextField
 
 class TerminalProcessDetectionTest {
+    @get:Rule
+    val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun `prefers a shared Codex home IPC socket`() {
+        assertEquals(
+            Path.of("/home/test/.codex/ipc/ipc.sock"),
+            selectUnixIpcSocketPath(
+                codexHome = Path.of("/home/test/.codex"),
+                systemTempDir = Path.of("/system/tmp"),
+                uid = 1000L,
+                codexHomeSocketExists = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `falls back to the native system temp IPC socket`() {
+        assertEquals(
+            Path.of("/system/tmp/codex-ipc/ipc-1000.sock"),
+            selectUnixIpcSocketPath(
+                codexHome = Path.of("/missing/.codex"),
+                systemTempDir = Path.of("/system/tmp"),
+                uid = 1000L,
+                codexHomeSocketExists = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `does not override Codex temp environment when launching`() {
+        val launch = buildTerminalLaunch("codex", "/workspace")
+
+        assertFalse(launch.command.contains("TMPDIR"))
+        assertFalse(launch.fallbackCommand.contains("TMPDIR"))
+        assertFalse(launch.command.contains("CODEX_JETBRAINS_TMPDIR"))
+        assertFalse(launch.fallbackCommand.contains("CODEX_JETBRAINS_TMPDIR"))
+    }
+
+    @Test
+    fun `joins an existing Codex IPC router as an IDE context provider`() {
+        Assume.assumeFalse(System.getProperty("os.name").startsWith("Windows"))
+        val socketPath = temporaryFolder.newFolder("codex-router").toPath().resolve("ipc.sock")
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            ServerSocketChannel.open(StandardProtocolFamily.UNIX).use { server ->
+                server.bind(UnixDomainSocketAddress.of(socketPath))
+                val initializeRequest = executor.submit<JsonObject> {
+                    server.accept().use { client ->
+                        val request = readTestFrame(client)
+                        writeTestFrame(
+                            client,
+                            mapOf(
+                                "type" to "response",
+                                "requestId" to request.get("requestId").asString,
+                                "resultType" to "success",
+                                "result" to mapOf("clientId" to "jetbrains-router-client"),
+                            ),
+                        )
+                        request
+                    }
+                }
+
+                val initialized = initializeUnixRouterConnection(socketPath, timeoutMillis = 2_000L)
+                initialized.channel.close()
+
+                val request = initializeRequest.get()
+                assertEquals("jetbrains-router-client", initialized.clientId)
+                assertEquals("initialize", request.get("method").asString)
+                assertEquals(
+                    "jetbrains-ide-context",
+                    request.getAsJsonObject("params").get("clientType").asString,
+                )
+            }
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
     @Test
     fun `detects command state from modern terminal widget`() {
         assertEquals(
@@ -376,6 +471,31 @@ class TerminalProcessDetectionTest {
                 listOf(terminal),
             ),
         )
+    }
+
+    private fun readTestFrame(channel: SocketChannel): JsonObject {
+        val length = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+        readTestFully(channel, length)
+        length.flip()
+        val payload = ByteBuffer.allocate(length.int)
+        readTestFully(channel, payload)
+        payload.flip()
+        return JsonParser.parseString(StandardCharsets.UTF_8.decode(payload).toString()).asJsonObject
+    }
+
+    private fun writeTestFrame(channel: SocketChannel, message: Any) {
+        val payload = Gson().toJson(message).toByteArray(StandardCharsets.UTF_8)
+        val frame = ByteBuffer.allocate(4 + payload.size).order(ByteOrder.LITTLE_ENDIAN)
+        frame.putInt(payload.size).put(payload).flip()
+        while (frame.hasRemaining()) {
+            channel.write(frame)
+        }
+    }
+
+    private fun readTestFully(channel: SocketChannel, buffer: ByteBuffer) {
+        while (buffer.hasRemaining()) {
+            check(channel.read(buffer) >= 0) { "IPC test connection closed early" }
+        }
     }
 
     private fun keyPress(source: JTextField, keyCode: Int): KeyEvent {
