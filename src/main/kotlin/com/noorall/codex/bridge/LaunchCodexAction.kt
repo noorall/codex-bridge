@@ -13,6 +13,8 @@
  */
 package com.noorall.codex.bridge
 
+import com.intellij.notification.NotificationGroupManager
+import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
@@ -594,6 +596,7 @@ private fun monitorCodexSession(
         var keyActivityTracker: TerminalKeyActivityTracker? = null
         var lastObservedEnterCount = 0L
         var enterInteraction: TerminalEnterInteraction? = null
+        var ideEnableFailureHandled = false
         val desktopHandoffTracker = DesktopHandoffTracker()
         try {
             keyActivityTracker = installTerminalKeyActivityTracker(widget)
@@ -642,6 +645,18 @@ private fun monitorCodexSession(
 
                 missingTextPolls = 0
                 val newDesktopHandoff = desktopHandoffTracker.observe(terminalText)
+                if (
+                    canManageIdeMode &&
+                    !ideEnableFailureHandled &&
+                    hasIdeContextEnableFailure(terminalText)
+                ) {
+                    ideEnableFailureHandled = true
+                    canManageIdeMode = false
+                    initialIdeMonitoring = false
+                    enterInteraction = null
+                    nextEnableAttemptMillis = Long.MAX_VALUE
+                    notifyIdeContextEnableFailure(project)
+                }
                 val ideContextOn = hasIdeContextIndicator(terminalText)
                 ideContextSeen = ideContextSeen || ideContextOn
                 if (ideContextOn) {
@@ -730,6 +745,22 @@ private fun monitorCodexSession(
     session.monitorControl.attach(task)
 }
 
+private fun notifyIdeContextEnableFailure(project: Project) {
+    try {
+        NotificationGroupManager.getInstance()
+            .getNotificationGroup(CODEX_NOTIFICATION_GROUP_ID)
+            .createNotification(
+                "Codex IDE context could not be enabled",
+                "Automatic IDE context has been stopped for this terminal session. " +
+                    "The installed Codex version may be incompatible with Codex CLI Bridge.",
+                NotificationType.WARNING,
+            )
+            .notify(project)
+    } catch (_: Throwable) {
+        // A notification failure must not stop Desktop handoff monitoring.
+    }
+}
+
 private fun refreshDesktopSessionSilently(project: Project, session: CodexTerminalSession) {
     val projectRoot = project.basePath?.let(Path::of) ?: return
     try {
@@ -803,7 +834,7 @@ internal class TerminalEnterInteraction(
     private var readyDeadlineMillis: Long? = null
 
     fun observe(nowMillis: Long, terminalReady: Boolean, ideContextOn: Boolean, manageIdeMode: Boolean) {
-        if (!terminalReady || (manageIdeMode && !ideContextOn)) {
+        if (manageIdeMode && (!terminalReady || !ideContextOn)) {
             if (readyDeadlineMillis == null) {
                 readyDeadlineMillis = nowMillis + readyTimeoutMillis
             }
@@ -1022,6 +1053,16 @@ private fun hasIdeContextIndicator(text: String): Boolean {
         .filter { it.isNotBlank() }
         .takeLast(CODEX_IDE_STATUS_SCAN_LINES)
         .any { CODEX_IDE_CONTEXT_INDICATOR_REGEX.containsMatchIn(it) }
+}
+
+internal fun hasIdeContextEnableFailure(terminalText: String): Boolean {
+    return terminalText.lineSequence().any(::isIdeContextEnableFailureLine)
+}
+
+internal fun isIdeContextEnableFailureLine(line: String): Boolean {
+    val normalized = line.trim()
+    return normalized == CODEX_IDE_ENABLE_FAILURE_MESSAGE ||
+        normalized == "\u2022 $CODEX_IDE_ENABLE_FAILURE_MESSAGE"
 }
 
 private fun readTerminalTail(widget: Any, maxChars: Int): String? {
@@ -1395,6 +1436,8 @@ private enum class CodexTerminalState {
 
 private const val CODEX_TERMINAL_TITLE = "Codex"
 private const val CODEX_IDE_ENABLE_COMMAND = "/ide on"
+private const val CODEX_IDE_ENABLE_FAILURE_MESSAGE = "IDE context could not be enabled."
+private const val CODEX_NOTIFICATION_GROUP_ID = "Codex CLI Bridge"
 private const val CODEX_EXIT_MARKER_PREFIX = "__CODEX_BRIDGE_EXIT_"
 private const val TERMINAL_ENTER_INPUT = "\r"
 private const val CODEX_READY_POLL_MILLIS = 250L

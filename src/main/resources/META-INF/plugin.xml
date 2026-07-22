@@ -45,6 +45,10 @@
         <statusBarWidgetFactory
                 id="CodexIdeContext"
                 implementation="com.noorall.codex.bridge.CodexContextStatusBarWidgetFactory"/>
+        <notificationGroup
+                id="Codex CLI Bridge"
+                displayType="BALLOON"
+                isLogByDefault="true"/>
     </extensions>
 
     <actions>

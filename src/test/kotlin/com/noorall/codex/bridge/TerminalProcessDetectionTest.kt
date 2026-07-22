@@ -190,6 +190,24 @@ class TerminalProcessDetectionTest {
     }
 
     @Test
+    fun `detects only an exact ide context enable failure line`() {
+        assertTrue(isIdeContextEnableFailureLine("IDE context could not be enabled."))
+        assertTrue(isIdeContextEnableFailureLine("  • IDE context could not be enabled.  "))
+        assertFalse(isIdeContextEnableFailureLine("› IDE context could not be enabled."))
+        assertFalse(isIdeContextEnableFailureLine("prefix IDE context could not be enabled."))
+        assertFalse(isIdeContextEnableFailureLine("IDE context could not be enabled"))
+        assertTrue(
+            hasIdeContextEnableFailure(
+                """
+                    • IDE context could not be enabled.
+
+                    › Write tests for @filename
+                """.trimIndent(),
+            ),
+        )
+    }
+
+    @Test
     fun `consumes each rendered desktop handoff only once`() {
         val tracker = DesktopHandoffTracker()
         val firstScreen = """
@@ -304,6 +322,33 @@ class TerminalProcessDetectionTest {
         )
         assertFalse(interaction.isComplete(6_000L, terminalReady = true, ideContextOn = false, manageIdeMode = true))
         assertTrue(interaction.isComplete(6_000L, terminalReady = true, ideContextOn = true, manageIdeMode = true))
+    }
+
+    @Test
+    fun `does not wait or retry ide recovery after ide management is disabled`() {
+        val interaction = TerminalEnterInteraction(
+            enteredAtMillis = 1_000L,
+            fastPollDurationMillis = 5_000L,
+            readyTimeoutMillis = 180_000L,
+        )
+
+        interaction.observe(2_000L, terminalReady = false, ideContextOn = false, manageIdeMode = false)
+
+        assertFalse(
+            interaction.shouldEnableIdeMode(
+                terminalReady = true,
+                ideContextOn = false,
+                manageIdeMode = false,
+            ),
+        )
+        assertTrue(
+            interaction.isComplete(
+                6_000L,
+                terminalReady = false,
+                ideContextOn = false,
+                manageIdeMode = false,
+            ),
+        )
     }
 
     @Test
