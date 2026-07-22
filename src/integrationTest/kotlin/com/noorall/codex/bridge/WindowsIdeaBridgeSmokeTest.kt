@@ -65,6 +65,7 @@ class WindowsIdeaBridgeSmokeTest {
         val ideaVersion = System.getProperty("codex.bridge.integration.ide.version")
         val pluginPath = File(requireNotNull(System.getProperty("path.to.build.plugin")))
         val pluginFolder = extractPluginFolder(pluginPath)
+        requireNoBundledJna(pluginFolder)
         val projectPath = Path.of("src", "integrationTest", "testData", "windows-smoke").toAbsolutePath().normalize()
 
         Starter.newContext(
@@ -111,6 +112,15 @@ class WindowsIdeaBridgeSmokeTest {
             "Expected one plugin directory in ${pluginPath.absolutePath}, found ${pluginDirectories.size}"
         }
         return pluginDirectories.single().toFile()
+    }
+
+    private fun requireNoBundledJna(pluginFolder: File) {
+        val bundledJna = pluginFolder.resolve("lib").listFiles().orEmpty().filter {
+            it.isFile && it.name.startsWith("jna-") && it.extension == "jar"
+        }
+        require(bundledJna.isEmpty()) {
+            "JNA must be loaded from the IntelliJ Platform, but the plugin bundles: ${bundledJna.joinToString { it.name }}"
+        }
     }
 
     private fun waitForNamedPipeConnection() {
