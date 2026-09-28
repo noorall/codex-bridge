@@ -46,6 +46,9 @@ import javax.swing.SwingUtilities
 
 private val activeCodexTerminals = Collections.synchronizedMap(mutableMapOf<String, CodexTerminalSession>())
 
+// Accessed only on EDT; coalesce clicks while a terminal process check is pending.
+private val pendingCodexTerminalChecks = mutableSetOf<String>()
+
 class LaunchCodexAction : AnAction() {
     override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 
@@ -148,17 +151,65 @@ private fun openIdeTerminal(
     launch: TerminalLaunch,
     autoEnableIdeContext: Boolean,
 ) {
+    val projectKey = projectTerminalKey(project)
+    if (projectKey in pendingCodexTerminalChecks) {
+        return
+    }
     val managerClass = Class.forName("org.jetbrains.plugins.terminal.TerminalToolWindowManager")
     val manager = managerClass.getMethod("getInstance", Project::class.java)
         .invoke(null, project)
     findReusableCodexTerminal(project, manager)?.let { existingSession ->
-        if (activateCodexTerminal(manager, existingSession)) {
-            project.service<CodexContextService>().sessionStarted(existingSession.lifecycleToken)
-            return
+        val app = ApplicationManager.getApplication()
+        pendingCodexTerminalChecks.add(projectKey)
+        try {
+            app.executeOnPooledThread {
+                // hasRunningCommands requires a background thread without a read action.
+                val processActive = runCatching { isCodexProcessActive(existingSession) }
+                app.invokeLater {
+                    pendingCodexTerminalChecks.remove(projectKey)
+                    if (project.isDisposed) {
+                        return@invokeLater
+                    }
+                    try {
+                        val active = processActive.getOrThrow()
+                        val currentSession = registeredCodexTerminal(project)
+                        if (currentSession != null && currentSession.lifecycleToken !== existingSession.lifecycleToken) {
+                            // A newer session replaced the one checked in the background.
+                            return@invokeLater
+                        }
+                        if (
+                            active && currentSession != null &&
+                            existingSession.processTracker.current() != TerminalProcessState.STOPPED &&
+                            isOpenTerminalSession(manager, existingSession) &&
+                            !isCodexExitMarkerVisible(existingSession) &&
+                            activateCodexTerminal(manager, existingSession)
+                        ) {
+                            project.service<CodexContextService>().sessionStarted(existingSession.lifecycleToken)
+                        } else {
+                            forgetCodexTerminal(project, existingSession)
+                            createCodexTerminal(project, manager, launch, autoEnableIdeContext)
+                        }
+                    } catch (error: Throwable) {
+                        Messages.showErrorDialog(project, "Could not open the JetBrains terminal:\n${error.message}", "Codex")
+                    }
+                }
+            }
+        } catch (error: Throwable) {
+            pendingCodexTerminalChecks.remove(projectKey)
+            throw error
         }
-        forgetCodexTerminal(project, existingSession)
+        return
     }
 
+    createCodexTerminal(project, manager, launch, autoEnableIdeContext)
+}
+
+private fun createCodexTerminal(
+    project: Project,
+    manager: Any,
+    launch: TerminalLaunch,
+    autoEnableIdeContext: Boolean,
+) {
     val reworkedSession = createReworkedTerminalSession(project, launch)
     if (reworkedSession != null) {
         rememberCodexTerminal(project, reworkedSession)
@@ -256,7 +307,7 @@ private fun findReusableCodexTerminal(project: Project, manager: Any): CodexTerm
         if (
             isOpenTerminalSession(manager, refreshedSession) &&
             !isCodexExitMarkerVisible(refreshedSession) &&
-            isCodexProcessActive(refreshedSession)
+            refreshedSession.processTracker.current() != TerminalProcessState.STOPPED
         ) {
             return refreshedSession
         }
