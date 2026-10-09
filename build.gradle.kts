@@ -10,7 +10,7 @@ plugins {
 }
 
 group = "com.noorall.codex"
-version = "0.1.4"
+version = "0.1.5-dev"
 
 repositories {
     mavenCentral()
