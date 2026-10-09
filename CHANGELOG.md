@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4] - 2026-10-09
+
+### Changed
+
+- Fix errors when reusing Codex terminals in newer JetBrains IDE versions.
+- Improve terminal reuse stability during repeated clicks and session changes.
+
 ## [0.1.3] - 2026-07-22
 
 ### Added
