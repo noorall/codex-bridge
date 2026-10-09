@@ -11,9 +11,13 @@ Codex CLI Bridge is a JetBrains IDE plugin that starts Codex CLI and provides pr
 
 The plugin keeps Codex CLI as the agent host in the terminal. JetBrains provides context for each project's active file, selection ranges, selected text, and open tabs. It does not use ACP or MCP, and it does not make the IDE host the agent.
 
-## Screenshot
+## Screenshots
 
 ![Codex CLI Bridge in a JetBrains IDE](docs/20260708153533.jpg)
+
+Codex Desktop using IDE context to identify the selected code:
+
+![Codex Desktop identifying the selected Kotlin property using IDE context](docs/codex-desktop-ide-context.jpg)
 
 ## What It Sends
 
