@@ -22,6 +22,7 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.service
+import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.util.Disposer
@@ -50,6 +51,8 @@ private val activeCodexTerminals = Collections.synchronizedMap(mutableMapOf<Stri
 private val pendingCodexTerminalChecks = mutableSetOf<String>()
 
 class LaunchCodexAction : AnAction() {
+    private val log = logger<LaunchCodexAction>()
+
     override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 
     override fun update(event: AnActionEvent) {
@@ -68,7 +71,8 @@ class LaunchCodexAction : AnAction() {
         try {
             bridge.ensureListening(project)
         } catch (error: Throwable) {
-            Messages.showErrorDialog(project, "Could not start Codex IDE bridge:\n${error.message}", "Codex")
+            log.warn("Could not launch Codex IDE bridge for project ${project.basePath}", error)
+            Messages.showErrorDialog(project, codexStartupErrorMessage("Could not start Codex IDE bridge", error), "Codex")
             return
         }
 
@@ -76,9 +80,19 @@ class LaunchCodexAction : AnAction() {
         try {
             openIdeTerminal(project, terminalLaunch, autoEnableIdeContext)
         } catch (error: Throwable) {
-            Messages.showErrorDialog(project, "Could not open the JetBrains terminal:\n${error.message}", "Codex")
+            log.warn("Could not open Codex terminal for project ${project.basePath}", error)
+            Messages.showErrorDialog(project, codexStartupErrorMessage("Could not open the JetBrains terminal", error), "Codex")
         }
     }
+}
+
+internal fun codexStartupErrorMessage(summary: String, error: Throwable): String {
+    val causes = generateSequence(error) { it.cause }
+        .take(10)
+        .map { it.message?.takeIf(String::isNotBlank) ?: it.javaClass.simpleName }
+        .distinct()
+        .joinToString("\nCaused by: ")
+    return "$summary:\n$causes\n\nSee idea.log for the full stack trace (Help | Show Log)."
 }
 
 internal data class TerminalLaunch(

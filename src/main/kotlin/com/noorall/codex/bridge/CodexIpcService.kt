@@ -103,7 +103,16 @@ class CodexIpcService : Disposable {
         if (sharedBridge?.isOpen != true) {
             sharedBridge?.close()
 
-            val bridge = bindSharedBridge()
+            val bridge = try {
+                bindSharedBridge(project)
+            } catch (error: Exception) {
+                log.warn(
+                    "Could not start Codex IDE bridge for project ${project.basePath} " +
+                        "(pid=${ProcessHandle.current().pid()}, os=${System.getProperty("os.name")})",
+                    error,
+                )
+                throw error
+            }
             sharedBridge = bridge
             log.info("Codex IDE context bridge active on ${bridge.endpointDescription}")
             executor.execute {
@@ -121,7 +130,7 @@ class CodexIpcService : Disposable {
         }
     }
 
-    private fun bindSharedBridge(): IpcBridge {
+    private fun bindSharedBridge(project: Project): IpcBridge {
         if (isWindows()) {
             return WindowsNamedPipeBridge()
         }
@@ -130,6 +139,7 @@ class CodexIpcService : Disposable {
         val uid = currentUid()
         val socketPath = systemTempIpcSocketPath(systemTempDir, uid)
         if (socketPath.exists()) {
+            log.info("Joining existing Codex IPC router at $socketPath")
             try {
                 return connectToUnixRouter(socketPath)
             } catch (error: IOException) {
@@ -138,10 +148,11 @@ class CodexIpcService : Disposable {
                 }
             }
         }
+        log.info("Starting shared Codex IDE router at $socketPath")
         prepareSocketPath(socketPath)
         val channel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
         channel.bind(UnixDomainSocketAddress.of(socketPath))
-        return UnixSocketBridge(socketPath, channel)
+        return UnixSocketBridge(socketPath, channel, CodexIdeRouter(executor) { handleMessage(it, project) })
     }
 
     @Synchronized
@@ -225,7 +236,7 @@ class CodexIpcService : Disposable {
 
     private fun runBridge(bridge: IpcBridge, project: Project) {
         when (bridge) {
-            is UnixSocketBridge -> acceptUnixSocketLoop(bridge.channel, project)
+            is UnixSocketBridge -> acceptUnixSocketLoop(bridge)
             is UnixRouterClientBridge -> handleRouterConnection(bridge, project)
             is WindowsNamedPipeBridge -> acceptWindowsPipeLoop(bridge, project)
         }
@@ -236,17 +247,24 @@ class CodexIpcService : Disposable {
             handleConnection(bridge.connection, project)
         } catch (error: IOException) {
             if (bridge.isOpen) {
-                log.warn("Lost the Codex IPC router connection", error)
+                log.warn("Lost the Codex IPC router connection at ${bridge.endpointDescription}", error)
             }
         }
     }
 
-    private fun acceptUnixSocketLoop(channel: ServerSocketChannel, project: Project) {
+    private fun acceptUnixSocketLoop(bridge: UnixSocketBridge) {
+        val channel = bridge.channel
         while (!Thread.currentThread().isInterrupted && channel.isOpen) {
             try {
                 val client = channel.accept()
                 executor.execute {
-                    handleConnection(SocketChannelConnection(client), project)
+                    try {
+                        bridge.router.handleConnection(SocketChannelConnection(client))
+                    } catch (error: IOException) {
+                        if (bridge.isOpen) {
+                            log.debug("Codex IDE router client disconnected", error)
+                        }
+                    }
                 }
             } catch (_: ClosedByInterruptException) {
                 return
@@ -359,7 +377,6 @@ class CodexIpcService : Disposable {
             }
             .maxByOrNull { it.first }
             ?.second
-            ?: liveProjects.singleOrNull()?.second
     }
 
     private fun projectMatchScore(workspaceRoot: String, projectRoot: String): Int? {
@@ -565,7 +582,6 @@ internal fun initializeUnixRouterConnection(
     }
 }
 
-private const val MAX_FRAME_BYTES = 256 * 1024 * 1024
 private const val CLIENT_ID = "jetbrains-client"
 private const val WINDOWS_PIPE_NAME = "\\\\.\\pipe\\codex-ipc"
 private const val ROUTER_CONNECT_TIMEOUT_MILLIS = 5000L
@@ -652,12 +668,14 @@ internal class UnixSocketFileWatcher(
 private data class UnixSocketBridge(
     val socketPath: Path,
     val channel: ServerSocketChannel,
+    val router: CodexIdeRouter,
 ) : IpcBridge {
     override val endpointDescription: String = socketPath.toString()
     override val isOpen: Boolean
         get() = channel.isOpen
 
     override fun close() {
+        router.close()
         try {
             channel.close()
         } catch (_: IOException) {
@@ -724,61 +742,6 @@ private class WindowsNamedPipeBridge : IpcBridge {
         }
         activeHandles.forEach { WindowsNamedPipes.closeHandle(it) }
         activeHandles.clear()
-    }
-}
-
-private interface IpcConnection : Closeable {
-    val isOpen: Boolean
-    fun readFrame(): String
-    fun writeFrame(message: String)
-}
-
-private class SocketChannelConnection(
-    private val channel: SocketChannel,
-) : IpcConnection {
-    override val isOpen: Boolean
-        get() = channel.isOpen
-
-    override fun readFrame(): String {
-        val lenBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-        readFully(lenBuffer)
-        lenBuffer.flip()
-        val length = lenBuffer.int
-        if (length < 0 || length > MAX_FRAME_BYTES) {
-            throw IOException("Codex IDE context frame is too large: $length")
-        }
-
-        val payload = ByteBuffer.allocate(length)
-        readFully(payload)
-        payload.flip()
-        return StandardCharsets.UTF_8.decode(payload).toString()
-    }
-
-    override fun writeFrame(message: String) {
-        val payload = message.toByteArray(StandardCharsets.UTF_8)
-        val lenBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(payload.size)
-        lenBuffer.flip()
-        writeFully(lenBuffer)
-        writeFully(ByteBuffer.wrap(payload))
-    }
-
-    private fun readFully(buffer: ByteBuffer) {
-        while (buffer.hasRemaining()) {
-            val count = channel.read(buffer)
-            if (count < 0) {
-                throw EOFException("Codex IDE context connection closed")
-            }
-        }
-    }
-
-    private fun writeFully(buffer: ByteBuffer) {
-        while (buffer.hasRemaining()) {
-            channel.write(buffer)
-        }
-    }
-
-    override fun close() {
-        channel.close()
     }
 }
 

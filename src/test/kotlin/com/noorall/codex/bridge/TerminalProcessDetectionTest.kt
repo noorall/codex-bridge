@@ -25,6 +25,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.awt.event.KeyEvent
+import java.io.IOException
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
@@ -43,6 +44,20 @@ import javax.swing.JTextField
 class TerminalProcessDetectionTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun `startup errors show the underlying router failure and log location`() {
+        val error = IOException(
+            "Could not join the active Codex IPC router at /tmp/ipc.sock",
+            IOException("Codex IPC router initialize failed: no-handler-for-request"),
+        )
+
+        val message = codexStartupErrorMessage("Could not start Codex IDE bridge", error)
+
+        assertTrue(message.contains("/tmp/ipc.sock"))
+        assertTrue(message.contains("Caused by: Codex IPC router initialize failed: no-handler-for-request"))
+        assertTrue(message.contains("idea.log"))
+    }
 
     @Test
     fun `uses the shared Codex home IPC socket for the desktop router`() {
