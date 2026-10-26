@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.5] - 2026-10-26
+
+### Fixed
+
+- Fix IDE bridge startup and context routing when multiple JetBrains IDEs run at the same time.
+- Fix automatic IDE context enablement when resuming older sessions with long conversation histories.
+
+### Changed
+
+- Include underlying startup errors, full exception traces, and terminal state changes in IDE logs for easier troubleshooting.
+
 ## [0.1.4] - 2026-10-09
 
 ### Changed
