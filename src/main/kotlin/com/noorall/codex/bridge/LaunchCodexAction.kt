@@ -46,6 +46,7 @@ import java.util.function.Consumer
 import javax.swing.SwingUtilities
 
 private val activeCodexTerminals = Collections.synchronizedMap(mutableMapOf<String, CodexTerminalSession>())
+private val terminalMonitorLog = logger<LaunchCodexAction>()
 
 // Accessed only on EDT; coalesce clicks while a terminal process check is pending.
 private val pendingCodexTerminalChecks = mutableSetOf<String>()
@@ -653,7 +654,10 @@ private fun monitorCodexSession(
         var lastObservedEnterCount = 0L
         var enterInteraction: TerminalEnterInteraction? = null
         var ideEnableFailureHandled = false
+        val ideEnableFailureTracker = IdeContextEnableFailureTracker()
         val desktopHandoffTracker = DesktopHandoffTracker()
+        var lastReportedState: Pair<CodexTerminalState, Boolean>? = null
+        terminalMonitorLog.info("Monitoring Codex terminal for project ${project.basePath} (autoEnableIdeContext=$autoEnableIdeContext)")
         try {
             keyActivityTracker = installTerminalKeyActivityTracker(widget)
             lastObservedEnterCount = keyActivityTracker?.enterCount() ?: 0L
@@ -675,6 +679,7 @@ private fun monitorCodexSession(
                 val nowMillis = System.currentTimeMillis()
                 if (initialIdeMonitoring && nowMillis >= initialEnableDeadlineMillis) {
                     initialIdeMonitoring = false
+                    terminalMonitorLog.warn("Timed out waiting to automatically enable Codex IDE context for project ${project.basePath}")
                 }
 
                 if (terminalText == null) {
@@ -701,11 +706,13 @@ private fun monitorCodexSession(
 
                 missingTextPolls = 0
                 val newDesktopHandoff = desktopHandoffTracker.observe(terminalText)
+                val newIdeEnableFailure = ideEnableFailureTracker.observe(terminalText)
                 if (
                     canManageIdeMode &&
                     !ideEnableFailureHandled &&
-                    hasIdeContextEnableFailure(terminalText)
+                    newIdeEnableFailure
                 ) {
+                    terminalMonitorLog.warn("A new Codex IDE enable attempt failed for project ${project.basePath}; stopping automatic IDE context")
                     ideEnableFailureHandled = true
                     canManageIdeMode = false
                     initialIdeMonitoring = false
@@ -717,8 +724,18 @@ private fun monitorCodexSession(
                 ideContextSeen = ideContextSeen || ideContextOn
                 if (ideContextOn) {
                     initialIdeMonitoring = false
+                    ideEnableFailureTracker.enableAttemptSucceeded()
                 }
-                val terminalReady = codexTerminalState(terminalText, codexSessionSeen) == CodexTerminalState.READY
+                val terminalState = codexTerminalState(terminalText, codexSessionSeen)
+                val observedState = terminalState to ideContextOn
+                if (observedState != lastReportedState) {
+                    terminalMonitorLog.info(
+                        "Codex terminal state for project ${project.basePath}: " +
+                            "state=$terminalState, ideContextOn=$ideContextOn, codexSessionPreviouslySeen=$codexSessionSeen",
+                    )
+                    lastReportedState = observedState
+                }
+                val terminalReady = terminalState == CodexTerminalState.READY
                 if (terminalReady) {
                     codexSessionSeen = true
                 }
@@ -756,6 +773,10 @@ private fun monitorCodexSession(
                                 tracker.withEnterSuppressed {
                                     tryEnableIdeMode(widget)
                                 }
+                            }
+                            if (submitted) {
+                                ideEnableFailureTracker.enableAttemptSubmitted()
+                                terminalMonitorLog.info("Submitted automatic /ide on for project ${project.basePath}")
                             }
                             val retryDelayMillis = if (ideContextSeen && submitted) {
                                 CODEX_IDE_ENABLE_COOLDOWN_MILLIS
@@ -1081,34 +1102,60 @@ private fun runOnEdtAndWait(action: () -> Unit) {
     }
 }
 
-private fun codexTerminalState(text: String, codexSessionSeen: Boolean): CodexTerminalState {
+internal fun codexTerminalState(text: String, codexSessionSeen: Boolean): CodexTerminalState {
     val hasCodexSessionText = CODEX_READY_MARKERS.any { marker ->
         text.contains(marker, ignoreCase = true)
     }
-    return if ((codexSessionSeen || hasCodexSessionText) && hasCodexReadyPrompt(text)) {
+    val footer = codexPromptFooter(text) ?: return CodexTerminalState.NON_MAIN
+    val hasCodexFooter = footer.any { CODEX_RESUMED_STATUS_REGEX.containsMatchIn(it) }
+    return if (codexSessionSeen || hasCodexSessionText || hasCodexFooter) {
         CodexTerminalState.READY
     } else {
         CodexTerminalState.NON_MAIN
     }
 }
 
-private fun hasCodexReadyPrompt(text: String): Boolean {
+private fun codexPromptFooter(text: String): List<String>? {
     val recentLines = text.lines()
         .filter { it.isNotBlank() }
         .takeLast(CODEX_PROMPT_SCAN_LINES)
     val promptLineIndex = recentLines.indexOfLast { CODEX_READY_PROMPT_REGEX.containsMatchIn(it) }
     if (promptLineIndex < 0) {
-        return false
+        return null
     }
     val trailingLines = recentLines.drop(promptLineIndex + 1)
-    return trailingLines.isEmpty() || trailingLines.all { CODEX_STATUS_LINE_REGEX.containsMatchIn(it) }
+    return trailingLines.takeIf { lines ->
+        lines.all {
+            CODEX_STATUS_LINE_REGEX.containsMatchIn(it) || CODEX_RESUMED_STATUS_REGEX.containsMatchIn(it)
+        }
+    }
 }
 
-private fun hasIdeContextIndicator(text: String): Boolean {
-    return text.lines()
-        .filter { it.isNotBlank() }
-        .takeLast(CODEX_IDE_STATUS_SCAN_LINES)
-        .any { CODEX_IDE_CONTEXT_INDICATOR_REGEX.containsMatchIn(it) }
+internal fun hasIdeContextIndicator(text: String): Boolean {
+    return codexPromptFooter(text)?.any { CODEX_IDE_CONTEXT_INDICATOR_REGEX.containsMatchIn(it) } == true
+}
+
+internal class IdeContextEnableFailureTracker {
+    private var observedCount = 0
+    private var awaitingAttemptResult = false
+
+    fun observe(terminalText: String): Boolean {
+        val currentCount = terminalText.lineSequence().count(::isIdeContextEnableFailureLine)
+        val newFailure = awaitingAttemptResult && currentCount > observedCount
+        observedCount = currentCount
+        if (newFailure) {
+            awaitingAttemptResult = false
+        }
+        return newFailure
+    }
+
+    fun enableAttemptSubmitted() {
+        awaitingAttemptResult = true
+    }
+
+    fun enableAttemptSucceeded() {
+        awaitingAttemptResult = false
+    }
 }
 
 internal fun hasIdeContextEnableFailure(terminalText: String): Boolean {
@@ -1169,8 +1216,9 @@ private fun tryEnableIdeMode(widget: Any): Boolean {
     return try {
         sendTerminalCommand(widget, CODEX_IDE_ENABLE_COMMAND, CODEX_IDE_ENABLE_ECHO_TIMEOUT_MILLIS) ||
             executeTerminalCommand(widget, CODEX_IDE_ENABLE_COMMAND)
-    } catch (ignored: Throwable) {
+    } catch (error: Throwable) {
         // If terminal injection fails, the Codex session is still usable and /ide can be run manually.
+        terminalMonitorLog.warn("Could not submit automatic /ide on to the Codex terminal", error)
         false
     }
 }
@@ -1485,7 +1533,7 @@ private fun isWindows(): Boolean {
     return System.getProperty("os.name").startsWith("Windows", ignoreCase = true)
 }
 
-private enum class CodexTerminalState {
+internal enum class CodexTerminalState {
     NON_MAIN,
     READY,
 }
@@ -1510,14 +1558,17 @@ private const val CODEX_COMMAND_SUBMIT_DELAY_MILLIS = 250L
 private const val CODEX_PROCESS_DETECTION_GRACE_NANOS = 2_000_000_000L
 private const val CODEX_READY_TIMEOUT_MILLIS = 180000L
 private const val CODEX_PROMPT_SCAN_LINES = 8
-private const val CODEX_IDE_STATUS_SCAN_LINES = 8
 private const val REWORKED_TERMINAL_TABS_MANAGER_CLASS =
     "com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager"
 private val POSIX_TRAP_SHELL_NAMES = setOf("sh", "ash", "bash", "dash", "ksh", "mksh", "zsh")
 private val COMMAND_RUNNING_METHOD_NAMES = listOf("isCommandRunning", "hasRunningCommands")
-private val CODEX_READY_PROMPT_REGEX = Regex("(?m)^\\s*(\\x{203a}\\s|Ask Codex\\b)")
+private val CODEX_READY_PROMPT_REGEX = Regex("(?m)^\\s*(\\x{203a}(?:\\s|$)|Ask Codex\\b)")
 private val CODEX_STATUS_LINE_REGEX = Regex("\\s\\u00b7\\s|\\bIDE context\\b", RegexOption.IGNORE_CASE)
 private val CODEX_IDE_CONTEXT_INDICATOR_REGEX = Regex("\\bIDE context\\b", RegexOption.IGNORE_CASE)
+private val CODEX_RESUMED_STATUS_REGEX = Regex(
+    "\\b\\d{1,3}%\\s+(?:context\\s+)?left\\b|\\bContext\\s+\\d{1,3}%\\s+used\\b|\\?\\s+for shortcuts\\b|\\bIDE context\\b",
+    RegexOption.IGNORE_CASE,
+)
 private val CODEX_READY_MARKERS = listOf(
     "OpenAI Codex",
     "/model to change",

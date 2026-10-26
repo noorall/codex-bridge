@@ -46,6 +46,81 @@ class TerminalProcessDetectionTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
+    fun `recognizes a resumed session after its startup banner scrolls out of the terminal tail`() {
+        val banner = "OpenAI Codex\nmodel: test\ndirectory: /workspace\n"
+        val readyScreen = "› Continue the task\n  test-model · 85% context left · ? for shortcuts"
+        val shortSession = banner + readyScreen
+        val longSession = banner + "Previous conversation output\n".repeat(1_000) + readyScreen
+
+        assertEquals(CodexTerminalState.READY, codexTerminalState(shortSession, codexSessionSeen = false))
+        assertEquals(
+            CodexTerminalState.READY,
+            codexTerminalState(longSession.takeLast(16_000), codexSessionSeen = false),
+        )
+    }
+
+    @Test
+    fun `does not treat IDE context mentioned in resumed history as an enabled status indicator`() {
+        val resumedScreen = """
+            • IDE context could not be enabled.
+            The previous conversation also mentioned IDE context.
+
+            › Continue the task
+
+              test-model · 85% context left · ? for shortcuts
+        """.trimIndent()
+
+        assertFalse(hasIdeContextIndicator(resumedScreen))
+    }
+
+    @Test
+    fun `recognizes the current IDE indicator below a resumed prompt`() {
+        val screen = "› Continue the task\n  test-model · 85% context left · IDE context"
+
+        assertEquals(CodexTerminalState.READY, codexTerminalState(screen, codexSessionSeen = false))
+        assertTrue(hasIdeContextIndicator(screen))
+    }
+
+    @Test
+    fun `recognizes a resumed empty prompt with a standalone context footer`() {
+        val screen = "›\n  85% context left"
+
+        assertEquals(CodexTerminalState.READY, codexTerminalState(screen, codexSessionSeen = false))
+    }
+
+    @Test
+    fun `does not mistake a resume picker or a running response for a ready prompt`() {
+        val picker = "› Yesterday's session\n  enter to resume · esc to exit"
+        val running = "› Continue the task\n• Working on the next step (esc to interrupt)"
+
+        assertEquals(CodexTerminalState.NON_MAIN, codexTerminalState(picker, codexSessionSeen = false))
+        assertEquals(CodexTerminalState.NON_MAIN, codexTerminalState(running, codexSessionSeen = true))
+    }
+
+    @Test
+    fun `ignores replayed IDE failures until a new enable attempt produces another failure`() {
+        val tracker = IdeContextEnableFailureTracker()
+        val history = "Previous conversation\n• IDE context could not be enabled.\n› Continue the task"
+
+        assertFalse(tracker.observe(history))
+        tracker.enableAttemptSubmitted()
+        assertFalse(tracker.observe(history))
+        assertTrue(tracker.observe("$history\n• IDE context could not be enabled."))
+        assertFalse(tracker.observe("$history\n• IDE context could not be enabled."))
+    }
+
+    @Test
+    fun `does not carry a successful enable attempt into another resumed history`() {
+        val tracker = IdeContextEnableFailureTracker()
+
+        tracker.observe("› Continue the task")
+        tracker.enableAttemptSubmitted()
+        tracker.enableAttemptSucceeded()
+
+        assertFalse(tracker.observe("• IDE context could not be enabled.\n› An older conversation"))
+    }
+
+    @Test
     fun `startup errors show the underlying router failure and log location`() {
         val error = IOException(
             "Could not join the active Codex IPC router at /tmp/ipc.sock",
